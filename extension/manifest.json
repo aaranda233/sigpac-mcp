@@ -50,9 +50,9 @@
     "server_url": {
       "type": "string",
       "title": "URL del servidor MCP",
-      "description": "URL del servidor MCP de SIGPAC (ej: http://192.168.2.203:31903/mcp)",
+      "description": "URL del servidor MCP de SIGPAC (ej: http://192.168.2.203:31904/mcp)",
       "required": true,
-      "default": "http://192.168.2.203:31903/mcp"
+      "default": "http://192.168.2.203:31904/mcp"
     }
   },
   "compatibility": {

@@ -4,7 +4,7 @@
  */
 const { spawn } = require("child_process");
 
-const serverUrl = process.env.MCP_SERVER_URL || "http://192.168.2.203:31903/mcp";
+const serverUrl = process.env.MCP_SERVER_URL || "http://192.168.2.203:31904/mcp";
 
 const child = spawn(
   "npx",
