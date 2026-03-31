@@ -4,17 +4,19 @@ Conecta a TecnicosNet y NetOpfh_26 en 192.168.2.36:1433.
 Incluye consulta directa a la API SIGPAC para comparar superficies.
 """
 
-import re
-import sys
+import gzip
 import json
+import re
 import ssl
+import sys
 import urllib.request
+
 import pymssql
+from mcp.server.fastmcp import FastMCP
 
 _SSL_CTX = ssl.create_default_context()
 _SSL_CTX.check_hostname = False
 _SSL_CTX.verify_mode = ssl.CERT_NONE
-from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("SIGPAC Explorer", host="0.0.0.0", port=8003)
 
@@ -49,7 +51,6 @@ def _sigpac_recinfo(prov, mun, pol, par, rec):
     """Consulta la API SIGPAC para obtener info oficial de un recinto."""
     url = f"{SIGPAC_API}/recinfo/{prov}/{mun}/0/0/{pol}/{par}/{rec}.json"
     try:
-        import gzip
         req = urllib.request.Request(url, headers={"Accept-Encoding": "gzip"})
         with urllib.request.urlopen(req, timeout=10, context=_SSL_CTX) as resp:
             raw = resp.read()
