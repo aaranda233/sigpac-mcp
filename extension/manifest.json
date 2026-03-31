@@ -1,0 +1,61 @@
+{
+  "manifest_version": "0.3",
+  "name": "sigpac-mcp",
+  "display_name": "SIGPAC Explorer",
+  "version": "1.0.0",
+  "description": "Consulta de recintos, agricultores y comparativa de superficies SIGPAC vs BD (TecnicosNet y NetOpfh_26).",
+  "author": {
+    "name": "Hortichuelas"
+  },
+  "server": {
+    "type": "node",
+    "entry_point": "server.js",
+    "mcp_config": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "${user_config.server_url}", "--allow-http"],
+      "env": {}
+    }
+  },
+  "tools": [
+    {
+      "name": "buscar_agricultores",
+      "description": "Busca agricultores por nombre o municipio"
+    },
+    {
+      "name": "recintos_agricultor",
+      "description": "Lista recintos de un agricultor con datos SIGPAC"
+    },
+    {
+      "name": "comparar_recinto",
+      "description": "Compara superficie BD vs SIGPAC oficial de un recinto"
+    },
+    {
+      "name": "listar_diferencias_opfh",
+      "description": "Recintos OPFH con diferencia de superficie > X%"
+    },
+    {
+      "name": "subrecintos_recinto",
+      "description": "Subrecintos de un recinto con propuesta de redistribucion"
+    },
+    {
+      "name": "consultar_sigpac",
+      "description": "Datos oficiales SIGPAC de un recinto"
+    },
+    {
+      "name": "run_select",
+      "description": "Ejecuta consultas SELECT de solo lectura (max 200 filas)"
+    }
+  ],
+  "user_config": {
+    "server_url": {
+      "type": "string",
+      "title": "URL del servidor MCP",
+      "description": "URL del servidor MCP de SIGPAC (ej: http://192.168.2.203:31903/mcp)",
+      "required": true,
+      "default": "http://192.168.2.203:31903/mcp"
+    }
+  },
+  "compatibility": {
+    "platforms": ["darwin", "win32"]
+  }
+}

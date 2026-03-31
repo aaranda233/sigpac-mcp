@@ -1,0 +1,61 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint-and-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install ruff
+
+      - name: Lint with ruff
+        run: ruff check mcp_server.py
+
+      - name: Check MCP server imports
+        run: python -c "from mcp.server.fastmcp import FastMCP; print('Imports OK')"
+
+  validate-mcpb:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Validate MCPB manifest
+        run: npx -y @anthropic-ai/mcpb validate extension/manifest.json
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t mcp-test .
+
+      - name: Smoke test — stdio transport
+        run: |
+          echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ci","version":"1.0"}}}' \
+            | timeout 10 docker run -i --rm mcp-test python mcp_server.py stdio \
+            | grep -q '"serverInfo"' && echo "MCP stdio OK" || (echo "FAILED" && exit 1)
+
+      - name: Smoke test — write protection
+        run: |
+          RESULT=$(echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ci","version":"1.0"}}}
+          {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"run_select","arguments":{"sql":"DROP TABLE test"}}}' \
+            | timeout 10 docker run -i --rm mcp-test python mcp_server.py stdio 2>&1)
+          echo "$RESULT" | grep -q "debe empezar con SELECT" && echo "Write protection OK" || (echo "FAILED: $RESULT" && exit 1)

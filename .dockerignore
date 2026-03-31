@@ -1,0 +1,7 @@
+.git
+.github
+extension/
+node_modules/
+src/
+package*.json
+*.md
