@@ -214,6 +214,26 @@ def parse_cod_recinto(cod: str) -> tuple[int, int, int, int, int]:
         raise ValueError(f"Código de recinto inválido '{cod}': todas las partes deben ser numéricas") from exc
 
 
+def _municipio_join() -> str:
+    """Genera la cláusula JOIN correcta con la tabla Municipios.
+
+    REC_Provincia (ej: '04') + REC_Municipio (ej: '00079') → código AEMET '04079'.
+    MUN_cdMunicipioAemet contiene el código real del municipio (PPMMM).
+
+    Usa MAX(MUN_Id) para evitar duplicados (ej: código 04066 tiene tanto
+    CAMPOHERMOSO como NIJAR; el de mayor MUN_Id es el registro más reciente/correcto).
+    """
+    return (
+        "LEFT JOIN ("
+        "  SELECT MUN_cdMunicipioAemet AS cod, MAX(MUN_Id) AS mid"
+        "  FROM Municipios GROUP BY MUN_cdMunicipioAemet"
+        ") mdup ON mdup.cod = "
+        "RIGHT('00' + LTRIM(RTRIM(r.REC_Provincia)), 2) + "
+        "RIGHT('000' + CAST(TRY_CAST(LTRIM(RTRIM(r.REC_Municipio)) AS INT) AS VARCHAR), 3) "
+        "LEFT JOIN Municipios m ON m.MUN_Id = mdup.mid"
+    )
+
+
 def redistribuir_subrecintos(subrecintos: list[dict], sigpac_m2: int, total_bd: int) -> list[dict]:
     """Redistribuye proporcionalmente los subrecintos al total SIGPAC.
 
@@ -281,7 +301,7 @@ def buscar_agricultores(nombre: str = "", municipio: str = "", solo_activos: boo
         LEFT JOIN RecintosSigpac r ON r.REC_IdAgricultor = a.AGR_Idagricultor
             AND r.REC_FechaBaja = '1900-01-01'
         LEFT JOIN Fincas f ON r.REC_IdFinca = f.FIN_IdFinca
-        LEFT JOIN Municipios m ON TRY_CAST(r.REC_Municipio AS INT) = m.MUN_Id
+        {_municipio_join()}
         WHERE {' AND '.join(where)}
         GROUP BY a.AGR_Idagricultor, a.AGR_Nombre, a.AGR_Nif, a.AGR_Poblacion, a.AGR_Provincia
         ORDER BY a.AGR_Nombre
@@ -315,7 +335,7 @@ def recintos_agricultor(agricultor_id: int) -> list[dict]:
             f.FIN_Nombre AS finca_nombre
         FROM RecintosSigpac r
         LEFT JOIN Fincas f ON r.REC_IdFinca = f.FIN_IdFinca
-        LEFT JOIN Municipios m ON TRY_CAST(r.REC_Municipio AS INT) = m.MUN_Id
+        {_municipio_join()}
         WHERE r.REC_IdAgricultor = {int(agricultor_id)}
           AND r.REC_FechaBaja = '1900-01-01'
         ORDER BY r.REC_Municipio, r.REC_Poligono, r.REC_Parcela, r.REC_Recinto
