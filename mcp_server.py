@@ -2,10 +2,14 @@
 
 Conecta a TecnicosNet y NetOpfh_26 en 192.168.2.36:1433.
 Incluye consulta directa a la API SIGPAC para comparar superficies.
+
+PRINCIPIO CRITICO: Nunca devolver datos falsos ni inventados.
+Si algo falla, devolver error explícito. Nunca silenciar errores.
 """
 
 import gzip
 import json
+import logging
 import re
 import ssl
 import sys
@@ -13,6 +17,9 @@ import urllib.request
 
 import pymssql
 from mcp.server.fastmcp import FastMCP
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("sigpac-mcp")
 
 _SSL_CTX = ssl.create_default_context()
 _SSL_CTX.check_hostname = False
@@ -30,6 +37,26 @@ DB_CONFIG = {
 
 SIGPAC_API = "https://sigpac-hubcloud.es/servicioconsultassigpac/query"
 
+# Campos obligatorios que debe tener una respuesta SIGPAC válida
+SIGPAC_REQUIRED_FIELDS = {"provincia", "municipio", "poligono", "parcela", "recinto", "superficie"}
+
+
+class SigpacApiError(Exception):
+    """Error al consultar la API SIGPAC."""
+
+
+class SigpacValidationError(Exception):
+    """Respuesta SIGPAC inválida o incompleta."""
+
+
+class DatabaseError(Exception):
+    """Error al consultar la base de datos."""
+
+
+# ---------------------------------------------------------------------------
+# HELPERS
+# ---------------------------------------------------------------------------
+
 
 def _connect(database: str = "TecnicosNet"):
     cfg = DB_CONFIG.copy()
@@ -38,17 +65,81 @@ def _connect(database: str = "TecnicosNet"):
 
 
 def _query(sql: str, database: str = "TecnicosNet") -> list[dict]:
-    conn = _connect(database)
+    try:
+        conn = _connect(database)
+    except Exception as exc:
+        logger.error("Error conectando a BD '%s': %s", database, exc)
+        raise DatabaseError(f"No se pudo conectar a la base de datos '{database}': {exc}") from exc
     try:
         cursor = conn.cursor(as_dict=True)
         cursor.execute(sql)
         return cursor.fetchall()
+    except Exception as exc:
+        logger.error("Error ejecutando SQL en '%s': %s", database, exc)
+        raise DatabaseError(f"Error ejecutando consulta en '{database}': {exc}") from exc
     finally:
         conn.close()
 
 
-def _sigpac_recinfo(prov, mun, pol, par, rec):
-    """Consulta la API SIGPAC para obtener info oficial de un recinto."""
+def _validate_sigpac_response(data: dict, prov, mun, pol, par, rec) -> dict:
+    """Valida que la respuesta SIGPAC sea coherente y completa.
+
+    Raises SigpacValidationError si los datos no son fiables.
+    """
+    missing = SIGPAC_REQUIRED_FIELDS - set(data.keys())
+    if missing:
+        raise SigpacValidationError(
+            f"Respuesta SIGPAC incompleta, faltan campos: {', '.join(sorted(missing))}"
+        )
+
+    sup = data.get("superficie")
+    if sup is None:
+        raise SigpacValidationError("El campo 'superficie' es None en la respuesta SIGPAC")
+    if not isinstance(sup, (int, float)):
+        raise SigpacValidationError(f"El campo 'superficie' no es numérico: {type(sup).__name__} = {sup!r}")
+    if sup < 0:
+        raise SigpacValidationError(f"Superficie negativa en SIGPAC: {sup} ha")
+    if sup > 100:
+        logger.warning("Superficie inusualmente grande: %.4f ha (recinto %s/%s/%s/%s/%s)", sup, prov, mun, pol, par, rec)
+
+    # Verificar que SIGPAC devolvió el recinto correcto (anti-confusión)
+    resp_rec = data.get("recinto")
+    resp_par = data.get("parcela")
+    resp_pol = data.get("poligono")
+    resp_mun = data.get("municipio")
+    resp_prov = data.get("provincia")
+
+    if resp_prov is not None and int(resp_prov) != int(prov):
+        raise SigpacValidationError(
+            f"SIGPAC devolvió provincia {resp_prov}, pero se pidió {prov}"
+        )
+    if resp_mun is not None and int(resp_mun) != int(mun):
+        raise SigpacValidationError(
+            f"SIGPAC devolvió municipio {resp_mun}, pero se pidió {mun}"
+        )
+    if resp_pol is not None and int(resp_pol) != int(pol):
+        raise SigpacValidationError(
+            f"SIGPAC devolvió polígono {resp_pol}, pero se pidió {pol}"
+        )
+    if resp_par is not None and int(resp_par) != int(par):
+        raise SigpacValidationError(
+            f"SIGPAC devolvió parcela {resp_par}, pero se pidió {par}"
+        )
+    if resp_rec is not None and int(resp_rec) != int(rec):
+        raise SigpacValidationError(
+            f"SIGPAC devolvió recinto {resp_rec}, pero se pidió {rec}"
+        )
+
+    return data
+
+
+def _sigpac_recinfo(prov, mun, pol, par, rec) -> dict:
+    """Consulta la API SIGPAC para obtener info oficial de un recinto.
+
+    Returns: dict con datos del recinto.
+    Raises: SigpacApiError si no se puede conectar.
+            SigpacValidationError si la respuesta es inválida.
+    """
     url = f"{SIGPAC_API}/recinfo/{prov}/{mun}/0/0/{pol}/{par}/{rec}.json"
     try:
         req = urllib.request.Request(url, headers={"Accept-Encoding": "gzip"})
@@ -59,9 +150,105 @@ def _sigpac_recinfo(prov, mun, pol, par, rec):
             except Exception:
                 pass
             data = json.loads(raw)
-            return data[0] if isinstance(data, list) and data else data if data else None
-    except Exception:
-        return None
+    except urllib.error.HTTPError as exc:
+        logger.error("HTTP %s al consultar SIGPAC: %s", exc.code, url)
+        raise SigpacApiError(
+            f"Error HTTP {exc.code} de la API SIGPAC para recinto {prov}/{mun}/{pol}/{par}/{rec}"
+        ) from exc
+    except urllib.error.URLError as exc:
+        logger.error("Error de red al consultar SIGPAC: %s", exc.reason)
+        raise SigpacApiError(
+            f"Error de red al consultar SIGPAC para recinto {prov}/{mun}/{pol}/{par}/{rec}: {exc.reason}"
+        ) from exc
+    except json.JSONDecodeError as exc:
+        logger.error("Respuesta SIGPAC no es JSON válido: %s", exc)
+        raise SigpacApiError(
+            f"Respuesta de SIGPAC no es JSON válido para recinto {prov}/{mun}/{pol}/{par}/{rec}"
+        ) from exc
+    except Exception as exc:
+        logger.error("Error inesperado al consultar SIGPAC: %s", exc)
+        raise SigpacApiError(
+            f"Error inesperado al consultar SIGPAC para recinto {prov}/{mun}/{pol}/{par}/{rec}: {exc}"
+        ) from exc
+
+    # Extraer el registro
+    if isinstance(data, list):
+        if not data:
+            raise SigpacApiError(
+                f"SIGPAC devolvió lista vacía para recinto {prov}/{mun}/{pol}/{par}/{rec}"
+            )
+        record = data[0]
+    elif isinstance(data, dict) and data:
+        record = data
+    else:
+        raise SigpacApiError(
+            f"Respuesta SIGPAC inesperada (tipo {type(data).__name__}) para recinto {prov}/{mun}/{pol}/{par}/{rec}"
+        )
+
+    return _validate_sigpac_response(record, prov, mun, pol, par, rec)
+
+
+def hectareas_a_m2(hectareas: float) -> int:
+    """Convierte hectáreas a metros cuadrados con redondeo correcto."""
+    return round(hectareas * 10000)
+
+
+def calcular_diferencia(sigpac_m2: int, bd_m2: int) -> dict:
+    """Calcula diferencia absoluta y porcentual entre SIGPAC y BD."""
+    diff_m2 = sigpac_m2 - bd_m2
+    diff_pct = round(diff_m2 / bd_m2 * 100, 2) if bd_m2 > 0 else None
+    return {"diferencia_m2": diff_m2, "diferencia_pct": diff_pct}
+
+
+def parse_cod_recinto(cod: str) -> tuple[int, int, int, int, int]:
+    """Parsea un código de recinto OPFH '4.66.24.1.3' -> (prov, mun, pol, par, rec).
+
+    Raises ValueError si el formato es inválido.
+    """
+    parts = cod.strip().split(".")
+    if len(parts) != 5:
+        raise ValueError(f"Código de recinto inválido '{cod}': debe tener 5 partes separadas por punto (prov.mun.pol.par.rec)")
+    try:
+        return tuple(int(p) for p in parts)
+    except ValueError as exc:
+        raise ValueError(f"Código de recinto inválido '{cod}': todas las partes deben ser numéricas") from exc
+
+
+def redistribuir_subrecintos(subrecintos: list[dict], sigpac_m2: int, total_bd: int) -> list[dict]:
+    """Redistribuye proporcionalmente los subrecintos al total SIGPAC.
+
+    Garantiza que la suma de propuestos == sigpac_m2 exactamente.
+    """
+    if total_bd <= 0 or not subrecintos:
+        return []
+
+    propuesta = []
+    for s in subrecintos:
+        metros = s.get("metros") or 0
+        new_m = round((metros / total_bd) * sigpac_m2)
+        propuesta.append({
+            "sur_id": s["sur_id"],
+            "cod_sub": s.get("cod_sub", ""),
+            "actual": metros,
+            "propuesto": new_m,
+            "diff": new_m - metros,
+        })
+
+    # Ajustar residuo al mayor para que la suma sea exacta
+    sum_new = sum(p["propuesto"] for p in propuesta)
+    remainder = sigpac_m2 - sum_new
+    if remainder != 0 and propuesta:
+        max_idx = max(range(len(propuesta)), key=lambda i: propuesta[i]["propuesto"])
+        propuesta[max_idx]["propuesto"] += remainder
+        propuesta[max_idx]["diff"] += remainder
+
+    # Verificación: la suma DEBE ser exacta
+    final_sum = sum(p["propuesto"] for p in propuesta)
+    assert final_sum == sigpac_m2, (
+        f"Error interno: redistribución incorrecta, suma={final_sum} != sigpac={sigpac_m2}"
+    )
+
+    return propuesta
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +286,11 @@ def buscar_agricultores(nombre: str = "", municipio: str = "", solo_activos: boo
         GROUP BY a.AGR_Idagricultor, a.AGR_Nombre, a.AGR_Nif, a.AGR_Poblacion, a.AGR_Provincia
         ORDER BY a.AGR_Nombre
     """
-    rows = _query(sql)
+    try:
+        rows = _query(sql)
+    except DatabaseError as exc:
+        return [{"error": f"Error consultando agricultores: {exc}"}]
+
     for r in rows:
         for k, v in r.items():
             if isinstance(v, str):
@@ -129,7 +320,11 @@ def recintos_agricultor(agricultor_id: int) -> list[dict]:
           AND r.REC_FechaBaja = '1900-01-01'
         ORDER BY r.REC_Municipio, r.REC_Poligono, r.REC_Parcela, r.REC_Recinto
     """
-    rows = _query(sql)
+    try:
+        rows = _query(sql)
+    except DatabaseError as exc:
+        return [{"error": f"Error consultando recintos del agricultor {agricultor_id}: {exc}"}]
+
     for r in rows:
         for k, v in r.items():
             if isinstance(v, str):
@@ -141,6 +336,9 @@ def recintos_agricultor(agricultor_id: int) -> list[dict]:
 def comparar_recinto(provincia: int, municipio: int, poligono: int, parcela: int, recinto: int) -> dict:
     """Compara la superficie de un recinto en la BD con la superficie oficial de SIGPAC.
 
+    IMPORTANTE: Si no se puede obtener la superficie de SIGPAC, devuelve error explícito.
+    Nunca devuelve datos inventados.
+
     Args:
         provincia: Codigo de provincia (ej: 4 para Almeria).
         municipio: Codigo de municipio.
@@ -148,42 +346,64 @@ def comparar_recinto(provincia: int, municipio: int, poligono: int, parcela: int
         parcela: Numero de parcela.
         recinto: Numero de recinto.
     """
+    ref = f"{provincia}/{municipio}/{poligono}/{parcela}/{recinto}"
+
     # BD
-    sql = f"""
-        SELECT TOP 1
-            r.REC_Id, r.REC_SuperficieSigPac AS superficie_bd,
-            a.AGR_Nombre AS agricultor, a.AGR_Nif AS nif
-        FROM RecintosSigpac r
-        LEFT JOIN Agricultores a ON r.REC_IdAgricultor = a.AGR_Idagricultor
-        WHERE TRY_CAST(r.REC_Municipio AS INT) = {int(municipio)}
-          AND TRY_CAST(r.REC_Poligono AS INT) = {int(poligono)}
-          AND TRY_CAST(r.REC_Parcela AS INT) = {int(parcela)}
-          AND TRY_CAST(r.REC_Recinto AS INT) = {int(recinto)}
-          AND r.REC_FechaBaja = '1900-01-01'
-    """
-    bd_rows = _query(sql)
+    try:
+        sql = f"""
+            SELECT TOP 1
+                r.REC_Id, r.REC_SuperficieSigPac AS superficie_bd,
+                a.AGR_Nombre AS agricultor, a.AGR_Nif AS nif
+            FROM RecintosSigpac r
+            LEFT JOIN Agricultores a ON r.REC_IdAgricultor = a.AGR_Idagricultor
+            WHERE TRY_CAST(r.REC_Municipio AS INT) = {int(municipio)}
+              AND TRY_CAST(r.REC_Poligono AS INT) = {int(poligono)}
+              AND TRY_CAST(r.REC_Parcela AS INT) = {int(parcela)}
+              AND TRY_CAST(r.REC_Recinto AS INT) = {int(recinto)}
+              AND r.REC_FechaBaja = '1900-01-01'
+        """
+        bd_rows = _query(sql)
+    except DatabaseError as exc:
+        return {"error": f"Error consultando BD para recinto {ref}: {exc}"}
+
     bd = bd_rows[0] if bd_rows else None
 
     # SIGPAC API
-    sigpac = _sigpac_recinfo(provincia, municipio, poligono, parcela, recinto)
-    sigpac_m2 = round(sigpac["superficie"] * 10000) if sigpac and sigpac.get("superficie") is not None else None
+    try:
+        sigpac = _sigpac_recinfo(provincia, municipio, poligono, parcela, recinto)
+    except (SigpacApiError, SigpacValidationError) as exc:
+        return {
+            "error": f"No se pudo obtener datos fiables de SIGPAC para recinto {ref}: {exc}",
+            "recinto": f"{provincia}-{municipio}-{poligono}-{parcela}-{recinto}",
+            "bd_m2": round(float(bd["superficie_bd"])) if bd and bd["superficie_bd"] is not None else None,
+            "sigpac_m2": None,
+            "datos_sigpac_fiables": False,
+        }
 
+    sigpac_m2 = hectareas_a_m2(sigpac["superficie"])
     bd_m2 = round(float(bd["superficie_bd"])) if bd and bd["superficie_bd"] is not None else None
 
     result = {
         "recinto": f"{provincia}-{municipio}-{poligono}-{parcela}-{recinto}",
         "bd_m2": bd_m2,
         "sigpac_m2": sigpac_m2,
-        "diferencia_m2": (sigpac_m2 - bd_m2) if sigpac_m2 is not None and bd_m2 is not None else None,
-        "diferencia_pct": round((sigpac_m2 - bd_m2) / bd_m2 * 100, 2) if sigpac_m2 is not None and bd_m2 and bd_m2 > 0 else None,
+        "datos_sigpac_fiables": True,
         "agricultor": bd["agricultor"].strip() if bd and bd.get("agricultor") else None,
         "nif": bd["nif"].strip() if bd and bd.get("nif") else None,
+        "sigpac_uso": sigpac.get("uso_sigpac"),
+        "sigpac_coef_regadio": sigpac.get("coef_regadio"),
+        "sigpac_pendiente": sigpac.get("pendiente_media"),
+        "sigpac_region": sigpac.get("region"),
     }
-    if sigpac:
-        result["sigpac_uso"] = sigpac.get("uso_sigpac")
-        result["sigpac_coef_regadio"] = sigpac.get("coef_regadio")
-        result["sigpac_pendiente"] = sigpac.get("pendiente_media")
-        result["sigpac_region"] = sigpac.get("region")
+
+    if sigpac_m2 is not None and bd_m2 is not None:
+        diff = calcular_diferencia(sigpac_m2, bd_m2)
+        result["diferencia_m2"] = diff["diferencia_m2"]
+        result["diferencia_pct"] = diff["diferencia_pct"]
+    else:
+        result["diferencia_m2"] = None
+        result["diferencia_pct"] = None
+
     return result
 
 
@@ -193,6 +413,7 @@ def listar_diferencias_opfh(min_pct: float = 0, max_results: int = 50) -> list[d
 
     Consulta NetOpfh_26 y compara con la API SIGPAC oficial. Solo devuelve los que tienen diferencia.
     ATENCION: puede tardar porque consulta la API SIGPAC para cada recinto.
+    Los recintos cuya consulta SIGPAC falle se reportan con error, no se omiten.
 
     Args:
         min_pct: Porcentaje minimo de diferencia para incluir (ej: 5 para >5%). Por defecto 0.
@@ -208,18 +429,25 @@ def listar_diferencias_opfh(min_pct: float = 0, max_results: int = 50) -> list[d
         INNER JOIN AA_Agricultores_Activos aa ON s.SUR_IdAgricultor = aa.AGR_Idagricultor
         ORDER BY r.REC_CodRecinto
     """
-    recintos = _query(sql)
+    try:
+        recintos = _query(sql)
+    except DatabaseError as exc:
+        return [{"error": f"Error consultando recintos OPFH: {exc}"}]
 
     results = []
+    errores = []
     for r in recintos:
         if len(results) >= max_results:
             break
-        sigpac = _sigpac_recinfo(r["prov"], r["mun"], r["pol"], r["par"], r["rec"])
-        if not sigpac or sigpac.get("superficie") is None:
+        try:
+            sigpac = _sigpac_recinfo(r["prov"], r["mun"], r["pol"], r["par"], r["rec"])
+        except (SigpacApiError, SigpacValidationError) as exc:
+            errores.append({"cod": r["cod"], "error": str(exc)})
             continue
-        sigpac_m2 = round(sigpac["superficie"] * 10000)
+
+        sigpac_m2 = hectareas_a_m2(sigpac["superficie"])
         bd_m2 = r["metros_bd"] or 0
-        if round(sigpac_m2) == round(bd_m2):
+        if sigpac_m2 == bd_m2:
             continue
         diff = sigpac_m2 - bd_m2
         pct = round(diff / bd_m2 * 100, 2) if bd_m2 > 0 else None
@@ -233,6 +461,12 @@ def listar_diferencias_opfh(min_pct: float = 0, max_results: int = 50) -> list[d
             "diff_pct": pct,
         })
 
+    if errores:
+        results.append({
+            "aviso": f"{len(errores)} recinto(s) no pudieron consultarse en SIGPAC",
+            "errores": errores[:10],
+        })
+
     return results
 
 
@@ -244,6 +478,12 @@ def subrecintos_recinto(cod_recinto: str) -> dict:
         cod_recinto: Codigo del recinto en formato OPFH (ej: '4.66.24.1.3').
     """
     cod = cod_recinto.replace("'", "")
+
+    try:
+        prov, mun, pol, par, rec = parse_cod_recinto(cod)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
     sql = f"""
         SELECT
             r.REC_CodRecinto AS cod, r.REC_Metros AS rec_metros,
@@ -256,18 +496,24 @@ def subrecintos_recinto(cod_recinto: str) -> dict:
         WHERE r.REC_CodRecinto = '{cod}'
         ORDER BY s.SUR_Id
     """
-    rows = _query(sql)
+    try:
+        rows = _query(sql)
+    except DatabaseError as exc:
+        return {"error": f"Error consultando subrecintos de '{cod}': {exc}"}
+
     if not rows:
-        return {"error": f"Recinto '{cod}' no encontrado"}
+        return {"error": f"Recinto '{cod}' no encontrado en la base de datos"}
 
     rec_metros = rows[0]["rec_metros"]
-    # Parse cod to get SIGPAC params
-    parts = cod.split(".")
-    sigpac = None
-    if len(parts) >= 5:
-        sigpac = _sigpac_recinfo(int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3]), int(parts[4]))
 
-    sigpac_m2 = round(sigpac["superficie"] * 10000) if sigpac and sigpac.get("superficie") is not None else None
+    # Consultar SIGPAC
+    sigpac_m2 = None
+    sigpac_error = None
+    try:
+        sigpac = _sigpac_recinfo(prov, mun, pol, par, rec)
+        sigpac_m2 = hectareas_a_m2(sigpac["superficie"])
+    except (SigpacApiError, SigpacValidationError) as exc:
+        sigpac_error = str(exc)
 
     subrecintos = []
     for r in rows:
@@ -283,32 +529,20 @@ def subrecintos_recinto(cod_recinto: str) -> dict:
         "cod": cod,
         "rec_metros_bd": rec_metros,
         "sigpac_m2": sigpac_m2,
-        "diferencia_m2": (sigpac_m2 - rec_metros) if sigpac_m2 is not None and rec_metros is not None else None,
+        "datos_sigpac_fiables": sigpac_error is None,
         "subrecintos": subrecintos,
         "sum_subrecintos": sum(s["metros"] or 0 for s in subrecintos),
     }
 
-    # Propuesta de redistribucion
-    if sigpac_m2 is not None and rec_metros and round(sigpac_m2) != round(rec_metros):
-        denom = rec_metros
-        propuesta = []
-        for s in subrecintos:
-            new_m = round((s["metros"] / denom) * sigpac_m2) if denom > 0 else s["metros"]
-            propuesta.append({
-                "sur_id": s["sur_id"],
-                "cod_sub": s["cod_sub"],
-                "actual": s["metros"],
-                "propuesto": new_m,
-                "diff": new_m - s["metros"],
-            })
-        # Ajustar residuo al mayor
-        sum_new = sum(p["propuesto"] for p in propuesta)
-        remainder = sigpac_m2 - sum_new
-        if remainder != 0 and propuesta:
-            max_idx = max(range(len(propuesta)), key=lambda i: propuesta[i]["propuesto"])
-            propuesta[max_idx]["propuesto"] += remainder
-            propuesta[max_idx]["diff"] += remainder
-        result["propuesta_redistribucion"] = propuesta
+    if sigpac_error:
+        result["error_sigpac"] = sigpac_error
+        result["diferencia_m2"] = None
+    else:
+        result["diferencia_m2"] = (sigpac_m2 - rec_metros) if sigpac_m2 is not None and rec_metros is not None else None
+
+    # Propuesta de redistribucion solo si tenemos datos SIGPAC fiables
+    if sigpac_m2 is not None and rec_metros and sigpac_m2 != rec_metros and sigpac_error is None:
+        result["propuesta_redistribucion"] = redistribuir_subrecintos(subrecintos, sigpac_m2, rec_metros)
 
     return result
 
@@ -317,6 +551,8 @@ def subrecintos_recinto(cod_recinto: str) -> dict:
 def consultar_sigpac(provincia: int, municipio: int, poligono: int, parcela: int, recinto: int) -> dict:
     """Consulta la API oficial de SIGPAC para obtener datos de un recinto.
 
+    IMPORTANTE: Si la consulta falla o los datos no son fiables, devuelve error explícito.
+
     Args:
         provincia: Codigo de provincia (ej: 4 para Almeria).
         municipio: Codigo de municipio.
@@ -324,11 +560,17 @@ def consultar_sigpac(provincia: int, municipio: int, poligono: int, parcela: int
         parcela: Numero de parcela.
         recinto: Numero de recinto.
     """
-    info = _sigpac_recinfo(provincia, municipio, poligono, parcela, recinto)
-    if not info:
-        return {"error": "Recinto no encontrado en SIGPAC"}
-    # Clean up response
-    result = {}
+    try:
+        info = _sigpac_recinfo(provincia, municipio, poligono, parcela, recinto)
+    except (SigpacApiError, SigpacValidationError) as exc:
+        return {
+            "error": str(exc),
+            "recinto_solicitado": f"{provincia}/{municipio}/{poligono}/{parcela}/{recinto}",
+            "datos_fiables": False,
+        }
+
+    # Clean up response - quitar WKT (muy largo) pero mantener todo lo demás
+    result = {"datos_fiables": True}
     for k, v in info.items():
         if v is not None and k != "wkt":
             result[k] = v
@@ -375,8 +617,10 @@ def run_select(sql: str, database: str = "TecnicosNet") -> list[dict]:
             for k, v in row.items():
                 row[k] = str(v)[:500] if v is not None else None
         return rows
-    except Exception as e:
-        return [{"error": str(e)}]
+    except DatabaseError as exc:
+        return [{"error": str(exc)}]
+    except Exception as exc:
+        return [{"error": f"Error inesperado: {exc}"}]
 
 
 if __name__ == "__main__":
