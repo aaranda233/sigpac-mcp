@@ -286,7 +286,7 @@ def buscar_agricultores(nombre: str = "", municipio: str = "", solo_activos: boo
     """
     where = ["a.AGR_Nombre != ''"]
     if solo_activos:
-        where.append("EXISTS (SELECT 1 FROM AA_Agricultores_Activos aa WHERE aa.AGR_Idagricultor = a.AGR_Idagricultor)")
+        where.append("EXISTS (SELECT 1 FROM Cultivos c WHERE c.CUL_IdAgriCultivo = a.AGR_Idagricultor AND c.CUL_FechaFinalizaReal = '1900-01-01')")
     if nombre:
         where.append(f"LOWER(a.AGR_Nombre) LIKE '%{nombre.lower().replace(chr(39), '')}%'")
     if municipio:
@@ -446,7 +446,7 @@ def listar_diferencias_opfh(min_pct: float = 0, max_results: int = 50) -> list[d
             r.REC_Metros AS metros_bd
         FROM NetOpfh_26.dbo.Recintos r
         INNER JOIN NetOpfh_26.dbo.SubRecintos s ON r.REC_CodRecinto = s.SUR_CodRecinto
-        INNER JOIN AA_Agricultores_Activos aa ON s.SUR_IdAgricultor = aa.AGR_Idagricultor
+        INNER JOIN (SELECT DISTINCT CUL_IdAgriCultivo AS AGR_Idagricultor FROM Cultivos WHERE CUL_FechaFinalizaReal = '1900-01-01') aa ON s.SUR_IdAgricultor = aa.AGR_Idagricultor
         ORDER BY r.REC_CodRecinto
     """
     try:
