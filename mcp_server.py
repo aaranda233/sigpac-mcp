@@ -298,9 +298,9 @@ def buscar_agricultores(nombre: str = "", municipio: str = "", solo_activos: boo
             a.AGR_Poblacion AS poblacion, a.AGR_Provincia AS provincia,
             COUNT(DISTINCT r.REC_Id) AS num_recintos
         FROM Agricultores a
-        LEFT JOIN RecintosSigpac r ON r.REC_IdAgricultor = a.AGR_Idagricultor
+        LEFT JOIN Fincas f ON f.FIN_IdAgricultor = a.AGR_Idagricultor
+        LEFT JOIN RecintosSigpac r ON r.REC_IdFinca = f.FIN_IdFinca
             AND r.REC_FechaBaja = '1900-01-01'
-        LEFT JOIN Fincas f ON r.REC_IdFinca = f.FIN_IdFinca
         {_municipio_join()}
         WHERE {' AND '.join(where)}
         GROUP BY a.AGR_Idagricultor, a.AGR_Nombre, a.AGR_Nif, a.AGR_Poblacion, a.AGR_Provincia
@@ -336,7 +336,7 @@ def recintos_agricultor(agricultor_id: int) -> list[dict]:
         FROM RecintosSigpac r
         LEFT JOIN Fincas f ON r.REC_IdFinca = f.FIN_IdFinca
         {_municipio_join()}
-        WHERE r.REC_IdAgricultor = {int(agricultor_id)}
+        WHERE f.FIN_IdAgricultor = {int(agricultor_id)}
           AND r.REC_FechaBaja = '1900-01-01'
         ORDER BY r.REC_Municipio, r.REC_Poligono, r.REC_Parcela, r.REC_Recinto
     """
@@ -375,7 +375,8 @@ def comparar_recinto(provincia: int, municipio: int, poligono: int, parcela: int
                 r.REC_Id, r.REC_SuperficieSigPac AS superficie_bd,
                 a.AGR_Nombre AS agricultor, a.AGR_Nif AS nif
             FROM RecintosSigpac r
-            LEFT JOIN Agricultores a ON r.REC_IdAgricultor = a.AGR_Idagricultor
+            LEFT JOIN Fincas f2 ON r.REC_IdFinca = f2.FIN_IdFinca
+            LEFT JOIN Agricultores a ON f2.FIN_IdAgricultor = a.AGR_Idagricultor
             WHERE TRY_CAST(r.REC_Municipio AS INT) = {int(municipio)}
               AND TRY_CAST(r.REC_Poligono AS INT) = {int(poligono)}
               AND TRY_CAST(r.REC_Parcela AS INT) = {int(parcela)}
