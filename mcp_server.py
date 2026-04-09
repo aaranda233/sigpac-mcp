@@ -17,6 +17,7 @@ import ssl
 import sys
 import urllib.request
 
+import PIL.ImageDraw
 import pymssql
 import staticmaps
 from mcp.server.fastmcp import FastMCP
@@ -317,7 +318,6 @@ def parse_wkt_polygon(wkt: str | None) -> list[tuple[float, float]]:
 
 
 # Monkey-patch: Pillow 10+ eliminó ImageDraw.textsize, py-staticmaps lo usa para attribution
-import PIL.ImageDraw
 if not hasattr(PIL.ImageDraw.ImageDraw, "textsize"):
     def _textsize(self, text, font=None, **kwargs):
         left, top, right, bottom = self.textbbox((0, 0), text, font=font, **kwargs)
