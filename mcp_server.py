@@ -316,14 +316,27 @@ def parse_wkt_polygon(wkt: str | None) -> list[tuple[float, float]]:
     return coords
 
 
+# Monkey-patch: Pillow 10+ eliminó ImageDraw.textsize, py-staticmaps lo usa para attribution
+import PIL.ImageDraw
+if not hasattr(PIL.ImageDraw.ImageDraw, "textsize"):
+    def _textsize(self, text, font=None, **kwargs):
+        left, top, right, bottom = self.textbbox((0, 0), text, font=font, **kwargs)
+        return right - left, bottom - top
+    PIL.ImageDraw.ImageDraw.textsize = _textsize
+
+# Tile providers sin attribution (evita problemas de renderizado de texto)
 _ARCGIS_TILE_PROVIDER = staticmaps.TileProvider(
     name="arcgis_world_imagery",
     url_pattern="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/$z/$y/$x",
-    attribution="Tiles (c) Esri",
     max_zoom=19,
 )
 
-_OSM_TILE_PROVIDER = staticmaps.tile_provider_OSM
+_OSM_TILE_PROVIDER = staticmaps.TileProvider(
+    name="osm",
+    url_pattern="https://$s.tile.openstreetmap.org/$z/$x/$y.png",
+    shards=["a", "b", "c"],
+    max_zoom=19,
+)
 
 
 def render_recinto_map(
@@ -340,11 +353,6 @@ def render_recinto_map(
 
     Returns: bytes PNG de la imagen.
     """
-    context = staticmaps.Context()
-
-    # Intentar ArcGIS satélite, fallback a OSM
-    context.set_tile_provider(_ARCGIS_TILE_PROVIDER)
-
     latlngs = [staticmaps.create_latlng(lat, lon) for lon, lat in coords]
 
     area = staticmaps.Area(
@@ -353,37 +361,38 @@ def render_recinto_map(
         color=staticmaps.parse_color("#ff00ff"),
         width=3,
     )
-    context.add_object(area)
 
-    try:
-        image = context.render_pillow(width, height)
-    except Exception:
-        # Fallback a OSM si ArcGIS falla
-        context_osm = staticmaps.Context()
-        context_osm.set_tile_provider(_OSM_TILE_PROVIDER)
-        context_osm.add_object(area)
+    for provider in [_ARCGIS_TILE_PROVIDER, _OSM_TILE_PROVIDER]:
         try:
-            image = context_osm.render_pillow(width, height)
-        except Exception:
-            # Último recurso: fondo blanco
-            from PIL import Image as PILImage, ImageDraw
-            image = PILImage.new("RGB", (width, height), "white")
-            draw = ImageDraw.Draw(image)
-            # Dibujar polígono escalado al canvas
-            lons = [c[0] for c in coords]
-            lats = [c[1] for c in coords]
-            min_lon, max_lon = min(lons), max(lons)
-            min_lat, max_lat = min(lats), max(lats)
-            range_lon = max_lon - min_lon or 0.001
-            range_lat = max_lat - min_lat or 0.001
-            margin = 20
-            w, h = width - 2 * margin, height - 2 * margin
-            scaled = [
-                (margin + (lon - min_lon) / range_lon * w,
-                 margin + (1 - (lat - min_lat) / range_lat) * h)
-                for lon, lat in coords
-            ]
-            draw.polygon(scaled, outline="#ff00ff", fill="#ff00ff1a")
+            context = staticmaps.Context()
+            context.set_tile_provider(provider)
+            context.add_object(area)
+            # Zoom automático + boost para que el recinto se vea grande
+            _center, auto_zoom = context.determine_center_zoom(width, height)
+            context.set_zoom(min(auto_zoom + 2, 18))
+            image = context.render_pillow(width, height)
+            break
+        except Exception as exc:
+            logger.warning("Tiles %s fallaron: %s", provider.name(), exc)
+    else:
+        # Último recurso: fondo blanco con polígono
+        from PIL import Image as PILImage, ImageDraw
+        image = PILImage.new("RGB", (width, height), "white")
+        draw = ImageDraw.Draw(image)
+        lons = [c[0] for c in coords]
+        lats = [c[1] for c in coords]
+        min_lon, max_lon = min(lons), max(lons)
+        min_lat, max_lat = min(lats), max(lats)
+        range_lon = max_lon - min_lon or 0.001
+        range_lat = max_lat - min_lat or 0.001
+        margin = 20
+        w, h = width - 2 * margin, height - 2 * margin
+        scaled = [
+            (margin + (lon - min_lon) / range_lon * w,
+             margin + (1 - (lat - min_lat) / range_lat) * h)
+            for lon, lat in coords
+        ]
+        draw.polygon(scaled, outline="#ff00ff")
 
     buf = io.BytesIO()
     image.save(buf, format="PNG")
