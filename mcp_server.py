@@ -7,7 +7,9 @@ PRINCIPIO CRITICO: Nunca devolver datos falsos ni inventados.
 Si algo falla, devolver error explícito. Nunca silenciar errores.
 """
 
+import base64
 import gzip
+import io
 import json
 import logging
 import re
@@ -16,7 +18,9 @@ import sys
 import urllib.request
 
 import pymssql
+import staticmaps
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ImageContent, TextContent
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("sigpac-mcp")
@@ -269,6 +273,121 @@ def redistribuir_subrecintos(subrecintos: list[dict], sigpac_m2: int, total_bd: 
     )
 
     return propuesta
+
+
+# ---------------------------------------------------------------------------
+# MAP HELPERS
+# ---------------------------------------------------------------------------
+
+_WKT_POLYGON_RE = re.compile(r"POLYGON\s*\(\((.+?)\)\)", re.IGNORECASE)
+
+
+def parse_wkt_polygon(wkt: str | None) -> list[tuple[float, float]]:
+    """Parsea un WKT POLYGON a lista de (lon, lat).
+
+    Raises SigpacValidationError si el WKT es nulo, vacío o no parseable.
+    """
+    if not wkt or not wkt.strip():
+        raise SigpacValidationError("El campo WKT está vacío o ausente")
+
+    # Comprobar MULTIPOLYGON antes que POLYGON (POLYGON matchea dentro de MULTIPOLYGON)
+    if "MULTIPOLYGON" in wkt.upper():
+        multi_re = re.search(r"MULTIPOLYGON\s*\(\s*\(\s*\((.+?)\)\s*\)", wkt, re.IGNORECASE)
+        if not multi_re:
+            raise SigpacValidationError(f"No se pudo parsear MULTIPOLYGON: {wkt[:100]}")
+        coords_str = multi_re.group(1)
+    else:
+        m = _WKT_POLYGON_RE.search(wkt)
+        if not m:
+            raise SigpacValidationError(f"WKT no contiene POLYGON válido: {wkt[:100]}")
+        coords_str = m.group(1)
+
+    coords = []
+    for pair in coords_str.split(","):
+        parts = pair.strip().split()
+        if len(parts) < 2:
+            continue
+        lon, lat = float(parts[0]), float(parts[1])
+        coords.append((lon, lat))
+
+    if len(coords) < 3:
+        raise SigpacValidationError(f"Polígono con menos de 3 vértices ({len(coords)})")
+
+    return coords
+
+
+_ARCGIS_TILE_PROVIDER = staticmaps.TileProvider(
+    name="arcgis_world_imagery",
+    url_pattern="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/$z/$y/$x",
+    attribution="Tiles (c) Esri",
+    max_zoom=19,
+)
+
+_OSM_TILE_PROVIDER = staticmaps.tile_provider_OSM
+
+
+def render_recinto_map(
+    coords: list[tuple[float, float]],
+    width: int = 600,
+    height: int = 400,
+) -> bytes:
+    """Renderiza un mapa PNG con el polígono del recinto.
+
+    Args:
+        coords: Lista de (lon, lat) del polígono.
+        width: Ancho de la imagen en píxeles.
+        height: Alto de la imagen en píxeles.
+
+    Returns: bytes PNG de la imagen.
+    """
+    context = staticmaps.Context()
+
+    # Intentar ArcGIS satélite, fallback a OSM
+    context.set_tile_provider(_ARCGIS_TILE_PROVIDER)
+
+    latlngs = [staticmaps.create_latlng(lat, lon) for lon, lat in coords]
+
+    area = staticmaps.Area(
+        latlngs,
+        fill_color=staticmaps.parse_color("#ff00ff1a"),
+        color=staticmaps.parse_color("#ff00ff"),
+        width=3,
+    )
+    context.add_object(area)
+
+    try:
+        image = context.render_pillow(width, height)
+    except Exception:
+        # Fallback a OSM si ArcGIS falla
+        context_osm = staticmaps.Context()
+        context_osm.set_tile_provider(_OSM_TILE_PROVIDER)
+        context_osm.add_object(area)
+        try:
+            image = context_osm.render_pillow(width, height)
+        except Exception:
+            # Último recurso: fondo blanco
+            from PIL import Image as PILImage, ImageDraw
+            image = PILImage.new("RGB", (width, height), "white")
+            draw = ImageDraw.Draw(image)
+            # Dibujar polígono escalado al canvas
+            lons = [c[0] for c in coords]
+            lats = [c[1] for c in coords]
+            min_lon, max_lon = min(lons), max(lons)
+            min_lat, max_lat = min(lats), max(lats)
+            range_lon = max_lon - min_lon or 0.001
+            range_lat = max_lat - min_lat or 0.001
+            margin = 20
+            w, h = width - 2 * margin, height - 2 * margin
+            scaled = [
+                (margin + (lon - min_lon) / range_lon * w,
+                 margin + (1 - (lat - min_lat) / range_lat) * h)
+                for lon, lat in coords
+            ]
+            draw.polygon(scaled, outline="#ff00ff", fill="#ff00ff1a")
+
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    return buf.getvalue()
 
 
 # ---------------------------------------------------------------------------
@@ -642,6 +761,77 @@ def run_select(sql: str, database: str = "TecnicosNet") -> list[dict]:
         return [{"error": str(exc)}]
     except Exception as exc:
         return [{"error": f"Error inesperado: {exc}"}]
+
+
+@mcp.tool()
+def mapa_recinto(
+    provincia: int,
+    municipio: int,
+    poligono: int,
+    parcela: int,
+    recinto: int,
+    ancho: int = 600,
+    alto: int = 400,
+) -> list[TextContent | ImageContent]:
+    """Genera una imagen de mapa con el recinto SIGPAC dibujado sobre imagen satélite.
+
+    Devuelve la imagen PNG en base64 junto con metadatos del recinto.
+    Útil para visualizar la ubicación y forma exacta de un recinto.
+
+    Args:
+        provincia: Codigo de provincia (ej: 4 para Almeria).
+        municipio: Codigo de municipio.
+        poligono: Numero de poligono.
+        parcela: Numero de parcela.
+        recinto: Numero de recinto.
+        ancho: Ancho de la imagen en píxeles (200-1200, por defecto 600).
+        alto: Alto de la imagen en píxeles (200-1200, por defecto 400).
+    """
+    ref = f"{provincia}/{municipio}/{poligono}/{parcela}/{recinto}"
+
+    # Validar tamaño
+    ancho = max(200, min(1200, ancho))
+    alto = max(200, min(1200, alto))
+
+    # Obtener datos del recinto incluyendo WKT
+    try:
+        info = _sigpac_recinfo(provincia, municipio, poligono, parcela, recinto)
+    except (SigpacApiError, SigpacValidationError) as exc:
+        return [TextContent(type="text", text=f"Error obteniendo datos SIGPAC para {ref}: {exc}")]
+
+    wkt = info.get("wkt")
+    try:
+        coords = parse_wkt_polygon(wkt)
+    except SigpacValidationError as exc:
+        return [TextContent(type="text", text=f"Error parseando geometría de {ref}: {exc}")]
+
+    # Renderizar mapa
+    try:
+        png_bytes = render_recinto_map(coords, ancho, alto)
+    except Exception as exc:
+        logger.error("Error renderizando mapa de %s: %s", ref, exc)
+        return [TextContent(type="text", text=f"Error generando imagen del mapa para {ref}: {exc}")]
+
+    # Metadatos
+    superficie_ha = info.get("superficie", "?")
+    uso = info.get("uso_sigpac", "?")
+    coef_reg = info.get("coef_regadio", "?")
+    region = info.get("region", "?")
+
+    metadata = (
+        f"Recinto {ref}\n"
+        f"Superficie: {superficie_ha} ha\n"
+        f"Uso SIGPAC: {uso}\n"
+        f"Coef. regadío: {coef_reg}\n"
+        f"Región: {region}"
+    )
+
+    b64 = base64.b64encode(png_bytes).decode("utf-8")
+
+    return [
+        TextContent(type="text", text=metadata),
+        ImageContent(type="image", data=b64, mimeType="image/png"),
+    ]
 
 
 if __name__ == "__main__":

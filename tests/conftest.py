@@ -19,7 +19,7 @@ def sigpac_response_valid():
         "coef_regadio": 1.0,
         "pendiente_media": 19,
         "region": "AL",
-        "wkt": "POLYGON((...))  ",
+        "wkt": "POLYGON((-2.4500 37.1000, -2.4490 37.1000, -2.4490 37.1010, -2.4500 37.1010, -2.4500 37.1000))  ",
     }
 
 

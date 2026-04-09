@@ -1,2 +1,4 @@
 mcp[cli]
 pymssql
+py-staticmaps
+Pillow
