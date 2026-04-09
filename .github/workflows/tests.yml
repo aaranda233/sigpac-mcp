@@ -55,7 +55,10 @@ jobs:
 
       - name: Smoke test — write protection
         run: |
-          RESULT=$(echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ci","version":"1.0"}}}
-          {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"run_select","arguments":{"sql":"DROP TABLE test"}}}' \
-            | timeout 10 docker run -i --rm mcp-test python mcp_server.py stdio 2>&1)
+          RESULT=$( (
+            echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ci","version":"1.0"}}}'
+            sleep 1
+            echo '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"run_select","arguments":{"sql":"DROP TABLE test"}}}'
+            sleep 2
+          ) | timeout 15 docker run -i --rm mcp-test python mcp_server.py stdio 2>&1)
           echo "$RESULT" | grep -q "debe empezar con SELECT" && echo "Write protection OK" || (echo "FAILED: $RESULT" && exit 1)
