@@ -394,9 +394,17 @@ def render_recinto_map(
         ]
         draw.polygon(scaled, outline="#ff00ff")
 
+    # Convert to JPEG to stay under MCP 1MB limit
+    image = image.convert("RGB")
     buf = io.BytesIO()
-    image.save(buf, format="PNG")
-    return buf.getvalue()
+    image.save(buf, format="JPEG", quality=70, optimize=True)
+    data = buf.getvalue()
+    # If still too large, reduce quality further
+    if len(data) > 700_000:
+        buf = io.BytesIO()
+        image.save(buf, format="JPEG", quality=40, optimize=True)
+        data = buf.getvalue()
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -799,8 +807,8 @@ def mapa_recinto(
     ref = f"{provincia}/{municipio}/{poligono}/{parcela}/{recinto}"
 
     # Validar tamaño
-    ancho = max(200, min(1200, ancho))
-    alto = max(200, min(1200, alto))
+    ancho = max(200, min(800, ancho))
+    alto = max(200, min(600, alto))
 
     # Obtener datos del recinto incluyendo WKT
     try:
@@ -839,7 +847,7 @@ def mapa_recinto(
 
     return [
         TextContent(type="text", text=metadata),
-        ImageContent(type="image", data=b64, mimeType="image/png"),
+        ImageContent(type="image", data=b64, mimeType="image/jpeg"),
     ]
 
 
