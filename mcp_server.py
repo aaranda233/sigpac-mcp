@@ -843,6 +843,498 @@ def mapa_recinto(
     ]
 
 
+# ---------------------------------------------------------------------------
+# TÉCNICOS
+# ---------------------------------------------------------------------------
+
+_LATEST_TECNICO_CTE = """
+WITH LatestTecnico AS (
+    SELECT f.FIN_IdAgricultor, c.CUL_IdTecnico,
+           ROW_NUMBER() OVER (PARTITION BY f.FIN_IdAgricultor ORDER BY c.CUL_IdTemporada DESC, c.CUL_IdCultivo DESC) AS rn
+    FROM Cultivos c INNER JOIN Fincas f ON c.CUL_IdFinca = f.FIN_IdFinca WHERE c.CUL_IdTecnico > 0
+)
+"""
+
+
+@mcp.tool()
+def listar_tecnicos() -> list[dict]:
+    """Lista todos los técnicos con el número de agricultores asignados (última temporada)."""
+    return _query(f"""
+        {_LATEST_TECNICO_CTE}
+        SELECT t.TEC_IdTecnico AS id, LTRIM(RTRIM(t.TEC_Nombre)) AS nombre, t.TEC_Activo AS activo,
+               COUNT(DISTINCT lt.FIN_IdAgricultor) AS agricultores
+        FROM LatestTecnico lt
+        INNER JOIN Tecnicos t ON lt.CUL_IdTecnico = TRY_CAST(t.TEC_IdTecnico AS INT)
+        INNER JOIN Agricultores a ON lt.FIN_IdAgricultor = a.AGR_Idagricultor AND a.AGR_Nombre != ''
+        WHERE lt.rn = 1
+        GROUP BY t.TEC_IdTecnico, t.TEC_Nombre, t.TEC_Activo
+        HAVING COUNT(DISTINCT lt.FIN_IdAgricultor) > 0
+        ORDER BY t.TEC_Nombre
+    """)
+
+
+@mcp.tool()
+def agricultores_tecnico(tecnico_id: int) -> list[dict]:
+    """Devuelve los agricultores asignados a un técnico (por última temporada), con NIF y nº de recintos."""
+    rows = _query(f"""
+        {_LATEST_TECNICO_CTE}
+        SELECT a.AGR_Idagricultor AS id, LTRIM(RTRIM(a.AGR_Nombre)) AS nombre, LTRIM(RTRIM(a.AGR_Nif)) AS nif,
+               COUNT(DISTINCT r.REC_Id) AS recintos
+        FROM LatestTecnico lt
+        INNER JOIN Agricultores a ON lt.FIN_IdAgricultor = a.AGR_Idagricultor AND a.AGR_Nombre != ''
+        LEFT JOIN Fincas f2 ON f2.FIN_IdAgricultor = a.AGR_Idagricultor
+        LEFT JOIN RecintosSigpac r ON r.REC_IdFinca = f2.FIN_IdFinca AND r.REC_FechaBaja = '1900-01-01' AND r.REC_Provincia != ''
+        WHERE lt.rn = 1 AND lt.CUL_IdTecnico = {int(tecnico_id)}
+        GROUP BY a.AGR_Idagricultor, a.AGR_Nombre, a.AGR_Nif
+        ORDER BY a.AGR_Nombre
+    """)
+    return rows
+
+
+@mcp.tool()
+def detalle_tecnicos(solo_activos: bool = True) -> list[dict]:
+    """Dashboard de técnicos: agricultores, zonas (provincia/municipio), BIO/CONV, superficie.
+
+    Args:
+        solo_activos: Si True, solo muestra agricultores con cultivos activos (no finalizados).
+    """
+    activo_join = (
+        "INNER JOIN (SELECT DISTINCT CUL_IdAgriCultivo AS AGR_Idagricultor FROM Cultivos "
+        "WHERE CUL_FechaFinalizaReal = '1900-01-01') aa ON a.AGR_Idagricultor = aa.AGR_Idagricultor"
+        if solo_activos else ""
+    )
+    rows = _query(f"""
+        {_LATEST_TECNICO_CTE}
+        SELECT CAST(t.TEC_IdTecnico AS INT) AS tecId, LTRIM(RTRIM(t.TEC_Nombre)) AS tecNombre, t.TEC_Activo AS tecActivo,
+               a.AGR_Idagricultor AS agrId, LTRIM(RTRIM(a.AGR_Nombre)) AS agrNombre, LTRIM(RTRIM(a.AGR_Nif)) AS agrNif,
+               UPPER(LTRIM(RTRIM(f2.FIN_Provincia))) AS provincia, LTRIM(RTRIM(f2.FIN_Municipio)) AS municipio,
+               COUNT(DISTINCT r2.REC_Id) AS recintos, SUM(r2.REC_SuperficieSigPac) AS superficie
+        FROM LatestTecnico lt
+        INNER JOIN Tecnicos t ON lt.CUL_IdTecnico = TRY_CAST(t.TEC_IdTecnico AS INT)
+        INNER JOIN Agricultores a ON lt.FIN_IdAgricultor = a.AGR_Idagricultor AND a.AGR_Nombre != ''
+        {activo_join}
+        LEFT JOIN Fincas f2 ON f2.FIN_IdAgricultor = a.AGR_Idagricultor
+        LEFT JOIN RecintosSigpac r2 ON r2.REC_IdFinca = f2.FIN_IdFinca AND r2.REC_FechaBaja = '1900-01-01' AND r2.REC_Provincia != ''
+        WHERE lt.rn = 1
+        GROUP BY t.TEC_IdTecnico, t.TEC_Nombre, t.TEC_Activo,
+                 a.AGR_Idagricultor, a.AGR_Nombre, a.AGR_Nif,
+                 UPPER(LTRIM(RTRIM(f2.FIN_Provincia))), LTRIM(RTRIM(f2.FIN_Municipio))
+        ORDER BY t.TEC_Nombre, a.AGR_Nombre
+    """)
+    # Aggregate into structured per-tecnico
+    norm = {"ALMERÍA": "ALMERIA", "JAÉN": "JAEN", "MÁLAGA": "MALAGA"}
+    tecs: dict = {}
+    for r in rows:
+        tid = r["tecId"]
+        if tid not in tecs:
+            tecs[tid] = {"id": tid, "nombre": r["tecNombre"].strip(), "activo": r["tecActivo"] == "S", "agricultores": {}, "zonas": {}}
+        t = tecs[tid]
+        aid = r["agrId"]
+        if aid not in t["agricultores"]:
+            t["agricultores"][aid] = {"id": aid, "nombre": r["agrNombre"], "nif": r["agrNif"], "recintos": 0, "superficie": 0.0, "municipios": []}
+        ag = t["agricultores"][aid]
+        ag["recintos"] += r["recintos"] or 0
+        ag["superficie"] += float(r["superficie"] or 0)
+        if r["municipio"]:
+            ag["municipios"].append(r["municipio"])
+        prov_raw = (r["provincia"] or "").strip()
+        prov = norm.get(prov_raw, prov_raw)
+        mun = r["municipio"] or ""
+        if prov and mun and (r["recintos"] or 0) > 0:
+            if prov not in t["zonas"]:
+                t["zonas"][prov] = {}
+            if mun not in t["zonas"][prov]:
+                t["zonas"][prov][mun] = {"agricultores": 0, "recintos": 0}
+            t["zonas"][prov][mun]["agricultores"] += 1
+            t["zonas"][prov][mun]["recintos"] += r["recintos"] or 0
+    result = []
+    for t in tecs.values():
+        agris = [
+            {**a, "municipios": list(set(a["municipios"])), "superficie": round(a["superficie"], 2)}
+            for a in t["agricultores"].values() if a["recintos"] > 0
+        ]
+        result.append({
+            "id": t["id"], "nombre": t["nombre"], "activo": t["activo"],
+            "totalAgricultores": len(agris),
+            "totalRecintos": sum(a["recintos"] for a in agris),
+            "totalSuperficie": round(sum(a["superficie"] for a in agris), 2),
+            "provincias": list(t["zonas"].keys()),
+            "zonas": t["zonas"],
+            "agricultores": agris,
+        })
+    return result
+
+
+# ---------------------------------------------------------------------------
+# INCIDENCIAS
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def incidencias(temporada_id: int = 0, tecnico_id: int = 0) -> dict:
+    """Detecta incidencias: cultivos sin cerrar, recintos compartidos y recintos huérfanos.
+
+    Args:
+        temporada_id: Filtrar cultivos sin cerrar por ID de temporada (0 = todas).
+        tecnico_id: Filtrar cultivos sin cerrar por ID de técnico (0 = todos).
+    """
+    # 1. Recintos compartidos
+    compartidos = _query("""
+        SELECT
+            TRY_CAST(r.REC_Provincia AS INT) AS prov, TRY_CAST(r.REC_Municipio AS INT) AS mun,
+            TRY_CAST(r.REC_Poligono AS INT) AS pol, TRY_CAST(r.REC_Parcela AS INT) AS par, TRY_CAST(r.REC_Recinto AS INT) AS rec,
+            f.FIN_IdAgricultor AS agrId, LTRIM(RTRIM(a.AGR_Nombre)) AS agrNombre, LTRIM(RTRIM(a.AGR_Nif)) AS agrNif,
+            LTRIM(RTRIM(f.FIN_Municipio)) AS municipio
+        FROM RecintosSigpac r
+        INNER JOIN Fincas f ON r.REC_IdFinca = f.FIN_IdFinca
+        INNER JOIN Agricultores a ON f.FIN_IdAgricultor = a.AGR_Idagricultor AND a.AGR_Nombre != ''
+        WHERE r.REC_FechaBaja = '1900-01-01' AND r.REC_Provincia != ''
+        AND EXISTS (
+            SELECT 1 FROM RecintosSigpac r2
+            INNER JOIN Fincas f2 ON r2.REC_IdFinca = f2.FIN_IdFinca
+            WHERE r2.REC_FechaBaja = '1900-01-01'
+              AND TRY_CAST(r2.REC_Provincia AS INT) = TRY_CAST(r.REC_Provincia AS INT)
+              AND TRY_CAST(r2.REC_Municipio AS INT) = TRY_CAST(r.REC_Municipio AS INT)
+              AND TRY_CAST(r2.REC_Poligono AS INT) = TRY_CAST(r.REC_Poligono AS INT)
+              AND TRY_CAST(r2.REC_Parcela AS INT) = TRY_CAST(r.REC_Parcela AS INT)
+              AND TRY_CAST(r2.REC_Recinto AS INT) = TRY_CAST(r.REC_Recinto AS INT)
+              AND f2.FIN_IdAgricultor != f.FIN_IdAgricultor
+        )
+        ORDER BY TRY_CAST(r.REC_Provincia AS INT), TRY_CAST(r.REC_Municipio AS INT)
+    """)
+    rec_map: dict = {}
+    for r in compartidos:
+        key = f"{r['prov']}-{r['mun']}-{r['pol']}-{r['par']}-{r['rec']}"
+        if key not in rec_map:
+            rec_map[key] = {"key": key, "municipio": r["municipio"] or "", "agricultores": []}
+        if not any(a["id"] == r["agrId"] for a in rec_map[key]["agricultores"]):
+            rec_map[key]["agricultores"].append({"id": r["agrId"], "nombre": r["agrNombre"], "nif": r["agrNif"]})
+    rec_compartidos = list(rec_map.values())
+
+    # 2. Recintos huérfanos
+    huerfanos = _query("""
+        SELECT REC_Id AS id, REC_Provincia AS prov, REC_Municipio AS mun,
+               REC_Poligono AS pol, REC_Parcela AS par, REC_Recinto AS rec, REC_IdFinca AS fincaId
+        FROM RecintosSigpac
+        WHERE REC_FechaBaja = '1900-01-01'
+          AND (REC_IdFinca IS NULL OR REC_IdFinca = 0 OR NOT EXISTS (SELECT 1 FROM Fincas f WHERE f.FIN_IdFinca = REC_IdFinca))
+    """)
+
+    # 3. Cultivos sin cerrar
+    where_extra = ""
+    if temporada_id:
+        where_extra += f" AND c.CUL_IdTemporada = {int(temporada_id)}"
+    if tecnico_id:
+        where_extra += f" AND c.CUL_IdTecnico = {int(tecnico_id)}"
+    cultivos = _query(f"""
+        SELECT c.CUL_IdCultivo AS id, c.CUL_IdTemporada AS tempId, LTRIM(RTRIM(tmp.TEM_Nombre)) AS temporada,
+               a.AGR_Idagricultor AS agrId, LTRIM(RTRIM(a.AGR_Nombre)) AS agricultor,
+               f.FIN_IdFinca AS fincaId, LTRIM(RTRIM(f.FIN_Nombre)) AS finca,
+               CAST(t.TEC_IdTecnico AS INT) AS tecId, LTRIM(RTRIM(t.TEC_Nombre)) AS tecnico,
+               LTRIM(RTRIM(t.TEC_Telefono)) AS tecTelefono, LTRIM(RTRIM(t.TEC_Email)) AS tecEmail,
+               LTRIM(RTRIM(g.GEN_Nombre)) AS genero
+        FROM Cultivos c
+        INNER JOIN Temporadas tmp ON c.CUL_IdTemporada = tmp.TEM_IdTemporada
+        INNER JOIN Fincas f ON c.CUL_IdFinca = f.FIN_IdFinca
+        INNER JOIN Agricultores a ON f.FIN_IdAgricultor = a.AGR_Idagricultor
+        LEFT JOIN Tecnicos t ON c.CUL_IdTecnico = TRY_CAST(t.TEC_IdTecnico AS INT)
+        LEFT JOIN Generos g ON c.CUL_IdGenero = g.GEN_IdGenero
+        WHERE c.CUL_FechaFinalizaReal = '1900-01-01'{where_extra}
+        ORDER BY c.CUL_IdTemporada DESC, a.AGR_Nombre
+    """)
+
+    # Temporadas with open cultivos
+    temp_map: dict = {}
+    for c in cultivos:
+        tid = c["tempId"]
+        if tid not in temp_map:
+            temp_map[tid] = {"id": tid, "nombre": c["temporada"], "count": 0}
+        temp_map[tid]["count"] += 1
+    temporadas = sorted(temp_map.values(), key=lambda x: x["id"], reverse=True)
+
+    return {
+        "resumen": {
+            "recintosCompartidos": len(rec_compartidos),
+            "recintosHuerfanos": len(huerfanos),
+            "cultivosSinCerrar": len(cultivos),
+            "total": len(rec_compartidos) + len(huerfanos) + len(cultivos),
+        },
+        "recCompartidos": rec_compartidos,
+        "recHuerfanos": huerfanos,
+        "cultivosSinCerrar": cultivos,
+        "temporadas": temporadas,
+    }
+
+
+@mcp.tool()
+def zona_influencia_tecnicos(provincias: list[int]) -> dict:
+    """Datos de zona de influencia por técnico: recintos con técnico asignado y tipo BIO/CONV.
+
+    Args:
+        provincias: Lista de códigos de provincia (4=Almería, 18=Granada, 23=Jaén, 29=Málaga, 30=Murcia).
+    """
+    code_to_name = {4: "ALMERIA", 18: "GRANADA", 23: "JAEN", 29: "MALAGA", 30: "MURCIA"}
+    accent = {"ALMERIA": "ALMERÍA", "JAEN": "JAÉN", "MALAGA": "MÁLAGA"}
+    prov_names = []
+    for c in provincias:
+        name = code_to_name.get(int(c), "")
+        if name:
+            prov_names.append(f"'{name}'")
+            if name in accent:
+                prov_names.append(f"'{accent[name]}'")
+    if not prov_names:
+        return {"error": "provincias requeridas"}
+    prov_in = ", ".join(prov_names)
+
+    rows = _query(f"""
+        {_LATEST_TECNICO_CTE}
+        SELECT
+            TRY_CAST(r.REC_Provincia AS INT) AS prov, TRY_CAST(r.REC_Municipio AS INT) AS mun,
+            TRY_CAST(r.REC_Poligono AS INT) AS pol, TRY_CAST(r.REC_Parcela AS INT) AS par,
+            TRY_CAST(r.REC_Recinto AS INT) AS rec,
+            LTRIM(RTRIM(f.FIN_Municipio)) AS munNombre,
+            a.AGR_Idagricultor AS agrId, LTRIM(RTRIM(a.AGR_Nombre)) AS agrNombre,
+            CAST(t.TEC_IdTecnico AS INT) AS tecId, LTRIM(RTRIM(t.TEC_Nombre)) AS tecNombre
+        FROM RecintosSigpac r
+        LEFT JOIN Fincas f ON r.REC_IdFinca = f.FIN_IdFinca
+        INNER JOIN Agricultores a ON f.FIN_IdAgricultor = a.AGR_Idagricultor AND a.AGR_Nombre != ''
+        INNER JOIN (SELECT DISTINCT CUL_IdAgriCultivo AS AGR_Idagricultor FROM Cultivos WHERE CUL_FechaFinalizaReal = '1900-01-01') aa ON a.AGR_Idagricultor = aa.AGR_Idagricultor
+        LEFT JOIN LatestTecnico lt ON lt.FIN_IdAgricultor = a.AGR_Idagricultor AND lt.rn = 1
+        LEFT JOIN Tecnicos t ON lt.CUL_IdTecnico = TRY_CAST(t.TEC_IdTecnico AS INT)
+        WHERE r.REC_Provincia != '' AND r.REC_FechaBaja = '1900-01-01'
+          AND UPPER(LTRIM(RTRIM(f.FIN_Provincia))) IN ({prov_in})
+    """)
+
+    # Deduplicate and build stats
+    seen: set = set()
+    recintos = []
+    tec_stats: dict = {}
+    for r in rows:
+        key = f"{r['prov']}-{r['mun']}-{r['pol']}-{r['par']}-{r['rec']}"
+        if "None" in key or key in seen:
+            continue
+        seen.add(key)
+        recintos.append({
+            "key": key, "municipio": r["munNombre"] or "",
+            "agrId": r["agrId"], "agrNombre": r["agrNombre"],
+            "tecId": r["tecId"], "tecNombre": r["tecNombre"] or "Sin técnico",
+            "tipo": "eco" if r["agrId"] >= 10000 else "conv",
+        })
+        tk = r["tecId"] or 0
+        if tk not in tec_stats:
+            tec_stats[tk] = {"id": r["tecId"], "nombre": r["tecNombre"] or "Sin técnico",
+                             "eco_agr": set(), "eco_rec": 0, "conv_agr": set(), "conv_rec": 0, "municipios": set()}
+        tipo = "eco" if r["agrId"] >= 10000 else "conv"
+        tec_stats[tk][f"{tipo}_agr"].add(r["agrId"])
+        tec_stats[tk][f"{tipo}_rec"] += 1
+        if r["munNombre"]:
+            tec_stats[tk]["municipios"].add(r["munNombre"])
+
+    tecnicos = sorted([
+        {"id": t["id"], "nombre": t["nombre"],
+         "eco": {"agricultores": len(t["eco_agr"]), "recintos": t["eco_rec"]},
+         "conv": {"agricultores": len(t["conv_agr"]), "recintos": t["conv_rec"]},
+         "totalAgricultores": len(t["eco_agr"]) + len(t["conv_agr"]),
+         "totalRecintos": t["eco_rec"] + t["conv_rec"],
+         "municipios": sorted(t["municipios"])}
+        for t in tec_stats.values()
+    ], key=lambda x: x["totalRecintos"], reverse=True)
+
+    prov_label = ", ".join(code_to_name.get(int(c), str(c)) for c in provincias)
+    return {
+        "recintos": recintos,
+        "tecnicos": tecnicos,
+        "meta": {"provincias": prov_label, "totalRecintos": len(recintos)},
+    }
+
+
+# ---------------------------------------------------------------------------
+# FONDOS OPERATIVOS (NetOpfh_26)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def opfh_recintos() -> dict:
+    """Lista recintos OPFH con sus subrecintos y agricultores asignados (solo activos)."""
+    rows = _query("""
+        SELECT r.REC_CodRecinto, r.REC_IdProvincia, r.REC_IdMunicipio,
+               r.REC_IdPoligono, r.REC_IdParcela, r.REC_IdRecinto, r.REC_Metros,
+               s.SUR_Id, s.SUR_CodSubRecinto, s.SUR_SubRecinto, s.SUR_Metros,
+               a.AGR_Nombre AS agrNombre
+        FROM NetOpfh_26.dbo.Recintos r
+        INNER JOIN NetOpfh_26.dbo.SubRecintos s ON r.REC_CodRecinto = s.SUR_CodRecinto
+        LEFT JOIN TecnicosNet.dbo.Agricultores a ON s.SUR_IdAgricultor = a.AGR_Idagricultor
+        WHERE r.REC_CodRecinto IN (
+            SELECT DISTINCT s2.SUR_CodRecinto
+            FROM NetOpfh_26.dbo.SubRecintos s2
+            INNER JOIN (SELECT DISTINCT CUL_IdAgriCultivo AS AGR_Idagricultor FROM TecnicosNet.dbo.Cultivos WHERE CUL_FechaFinalizaReal = '1900-01-01') aa ON s2.SUR_IdAgricultor = aa.AGR_Idagricultor
+        )
+        ORDER BY r.REC_CodRecinto, s.SUR_Id
+    """)
+    rec_map: dict = {}
+    for r in rows:
+        cod = r["REC_CodRecinto"]
+        if cod not in rec_map:
+            rec_map[cod] = {
+                "cod": cod, "prov": r["REC_IdProvincia"], "mun": r["REC_IdMunicipio"],
+                "pol": r["REC_IdPoligono"], "par": r["REC_IdParcela"], "rec": r["REC_IdRecinto"],
+                "metros": r["REC_Metros"], "subrecintos": [],
+            }
+        if r["SUR_Id"] is not None:
+            rec_map[cod]["subrecintos"].append({
+                "id": r["SUR_Id"], "cod": r["SUR_CodSubRecinto"],
+                "label": r["SUR_SubRecinto"], "metros": r["SUR_Metros"],
+                "agrNombre": (r["agrNombre"] or "").strip(),
+            })
+    recintos = list(rec_map.values())
+    return {"recintos": recintos, "meta": {"totalRecintos": len(recintos)}}
+
+
+@mcp.tool()
+def opfh_agricultores_por_nif(nifs: list[str]) -> dict:
+    """Resuelve nombres de agricultores a partir de una lista de NIFs.
+
+    Args:
+        nifs: Lista de NIFs a buscar.
+    """
+    if not nifs:
+        return {"agricultores": {}}
+    safe_nifs = [n.strip().replace("'", "") for n in nifs[:2000]]
+    in_clause = ", ".join(f"'{n}'" for n in safe_nifs)
+    rows = _query(f"""
+        SELECT LTRIM(RTRIM(AGR_Nif)) AS nif, LTRIM(RTRIM(AGR_Nombre)) AS nombre
+        FROM TecnicosNet.dbo.Agricultores
+        WHERE AGR_Nif IN ({in_clause}) AND AGR_Nombre != ''
+    """)
+    result: dict = {}
+    for r in rows:
+        if r["nif"] and r["nif"] not in result:
+            result[r["nif"]] = r["nombre"]
+    return {"agricultores": result}
+
+
+@mcp.tool()
+def control_presupuestario(incluir_obsoletas: bool = False) -> dict:
+    """Control presupuestario MPO 2026: conceptos, socios, liberación, capas, objetivos.
+
+    Args:
+        incluir_obsoletas: Si True, incluye líneas marcadas como obsoletas.
+    """
+    obs_filter = "" if incluir_obsoletas else "AND frl.FRL_ObsoletaSN != 'S'"
+    obs_where = "" if incluir_obsoletas else "WHERE frl.FRL_ObsoletaSN != 'S'"
+
+    # Presupuestado por concepto
+    pres_con = _query(f"""
+        SELECT c.CPT_CodConcepto AS codigo, LTRIM(RTRIM(c.CPT_Nombre)) AS concepto,
+            COUNT(*) AS lineas, SUM(frl.FRL_TotalSubvencionableLinea) AS presupuestado
+        FROM Facturas_Lineas frl JOIN Conceptos c ON c.CPT_CodConcepto = frl.FRL_CodConcepto
+        {obs_where} GROUP BY c.CPT_CodConcepto, c.CPT_Nombre ORDER BY SUM(frl.FRL_TotalSubvencionableLinea) DESC
+    """, database="NetOpfh_26")
+
+    # Ejecutado por concepto
+    eje_con = _query("""
+        SELECT c.CPT_CodConcepto AS codigo, LTRIM(RTRIM(c.CPT_Nombre)) AS concepto,
+            COUNT(*) AS lineas, SUM(d.FDL_TotalSubvencionableLinea) AS ejecutado
+        FROM FacturasDefinitivas_Lineas d
+        JOIN FacturasDefinitivas fd ON fd.FDF_IdFactura = d.FDL_IdFactura
+        JOIN Conceptos c ON c.CPT_CodConcepto = d.FDL_CodConcepto
+        GROUP BY c.CPT_CodConcepto, c.CPT_Nombre ORDER BY SUM(d.FDL_TotalSubvencionableLinea) DESC
+    """, database="NetOpfh_26")
+
+    # Presupuestado por socio
+    pres_soc = _query(f"""
+        SELECT a.AGR_Idagricultor AS id, LTRIM(RTRIM(a.AGR_Nombre)) AS nombre,
+            COUNT(*) AS lineas, SUM(frl.FRL_TotalSubvencionableLinea) AS presupuestado
+        FROM Facturas_Lineas frl
+        JOIN Facturas f ON f.FRA_IdFactura = frl.FRL_IdFactura
+        JOIN AA_Replica_Agricultores a ON a.AGR_Idagricultor = f.FRA_IdAgricultor
+        {obs_where} GROUP BY a.AGR_Idagricultor, a.AGR_Nombre ORDER BY SUM(frl.FRL_TotalSubvencionableLinea) DESC
+    """, database="NetOpfh_26")
+
+    # Ejecutado por socio
+    eje_soc = _query("""
+        SELECT a.AGR_Idagricultor AS id, LTRIM(RTRIM(a.AGR_Nombre)) AS nombre,
+            COUNT(*) AS lineas, SUM(d.FDL_TotalSubvencionableLinea) AS ejecutado
+        FROM FacturasDefinitivas_Lineas d
+        JOIN FacturasDefinitivas fd ON fd.FDF_IdFactura = d.FDL_IdFactura
+        JOIN Facturas_Lineas frl ON frl.FRL_Id = d.FDL_IdLineaProforma
+        JOIN Facturas f ON f.FRA_IdFactura = frl.FRL_IdFactura
+        JOIN AA_Replica_Agricultores a ON a.AGR_Idagricultor = f.FRA_IdAgricultor
+        GROUP BY a.AGR_Idagricultor, a.AGR_Nombre ORDER BY SUM(d.FDL_TotalSubvencionableLinea) DESC
+    """, database="NetOpfh_26")
+
+    # Liberación línea a línea
+    liberacion = _query(f"""
+        SELECT frl.FRL_Id AS id, a.AGR_Idagricultor AS codAgr, LTRIM(RTRIM(a.AGR_Nombre)) AS socio,
+            c.CPT_CodConcepto AS concepto, LTRIM(RTRIM(c.CPT_Nombre)) AS descripcion,
+            frl.FRL_TotalSubvencionableLinea AS proforma,
+            dg.defTotal AS definitiva,
+            f.FRA_IdFactura AS idFactura, f.FRA_IdMAC AS idMac
+        FROM Facturas_Lineas frl
+        JOIN Facturas f ON f.FRA_IdFactura = frl.FRL_IdFactura
+        JOIN AA_Replica_Agricultores a ON a.AGR_Idagricultor = f.FRA_IdAgricultor
+        JOIN Conceptos c ON c.CPT_CodConcepto = frl.FRL_CodConcepto
+        LEFT JOIN (
+            SELECT d.FDL_IdLineaProforma, SUM(d.FDL_TotalSubvencionableLinea) AS defTotal
+            FROM FacturasDefinitivas_Lineas d JOIN FacturasDefinitivas fd ON fd.FDF_IdFactura = d.FDL_IdFactura
+            GROUP BY d.FDL_IdLineaProforma
+        ) dg ON dg.FDL_IdLineaProforma = frl.FRL_Id
+        WHERE (frl.FRL_TotalSubvencionableLinea > 0 OR dg.defTotal > 0) {obs_filter}
+        ORDER BY frl.FRL_TotalSubvencionableLinea DESC
+    """, database="NetOpfh_26")
+
+    lib_rows = []
+    for r in liberacion:
+        pro = r["proforma"] or 0
+        defi = r["definitiva"] or 0
+        estado = "PENDIENTE"
+        if defi > 0 and defi == pro:
+            estado = "EJECUTADO IGUAL"
+        elif defi > 0 and defi < pro:
+            estado = "LIBERADO"
+        elif defi > pro > 0:
+            estado = "EJECUTADO CON AUMENTO"
+        lib_rows.append({**r, "liberado": pro - defi, "estado": estado})
+
+    # Capas
+    pres_capa = _query(f"""
+        SELECT CASE WHEN frl.FRL_CodConcepto LIKE '2.f%' THEN 'retiradas'
+                    WHEN frl.FRL_CodConcepto LIKE '2.%' THEN 'crisis' ELSE 'gastos50' END AS capa,
+            SUM(frl.FRL_TotalSubvencionableLinea) AS presupuestado
+        FROM Facturas_Lineas frl {obs_where}
+        GROUP BY CASE WHEN frl.FRL_CodConcepto LIKE '2.f%' THEN 'retiradas' WHEN frl.FRL_CodConcepto LIKE '2.%' THEN 'crisis' ELSE 'gastos50' END
+    """, database="NetOpfh_26")
+    eje_capa = _query("""
+        SELECT CASE WHEN d.FDL_CodConcepto LIKE '2.f%' THEN 'retiradas'
+                    WHEN d.FDL_CodConcepto LIKE '2.%' THEN 'crisis' ELSE 'gastos50' END AS capa,
+            SUM(d.FDL_TotalSubvencionableLinea) AS ejecutado
+        FROM FacturasDefinitivas_Lineas d JOIN FacturasDefinitivas fd ON fd.FDF_IdFactura = d.FDL_IdFactura
+        GROUP BY CASE WHEN d.FDL_CodConcepto LIKE '2.f%' THEN 'retiradas' WHEN d.FDL_CodConcepto LIKE '2.%' THEN 'crisis' ELSE 'gastos50' END
+    """, database="NetOpfh_26")
+    capas: dict = {}
+    for r in pres_capa:
+        capas[r["capa"]] = {"presupuestado": r["presupuestado"] or 0, "ejecutado": 0}
+    for r in eje_capa:
+        if r["capa"] not in capas:
+            capas[r["capa"]] = {"presupuestado": 0, "ejecutado": 0}
+        capas[r["capa"]]["ejecutado"] = r["ejecutado"] or 0
+
+    # Anualidad
+    anualidad = _query("SELECT LimiteAyuda, LimiteGestionCrisis FROM Anualidad WHERE LTRIM(RTRIM(Anualidad)) = '2026'", database="NetOpfh_26")
+
+    total_pres = sum(r.get("presupuestado", 0) or 0 for r in pres_con)
+    total_eje = sum(r.get("ejecutado", 0) or 0 for r in eje_con)
+
+    return {
+        "conceptos": {"presupuestado": pres_con, "ejecutado": eje_con},
+        "socios": {"presupuestado": pres_soc, "ejecutado": eje_soc},
+        "liberacion": lib_rows,
+        "totales": {"presupuestado": total_pres, "ejecutado": total_eje},
+        "capas": capas,
+        "anualidad": anualidad[0] if anualidad else None,
+    }
+
+
 if __name__ == "__main__":
     transport = sys.argv[1] if len(sys.argv) > 1 else "streamable-http"
     mcp.run(transport=transport)
