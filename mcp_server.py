@@ -406,12 +406,12 @@ if not hasattr(PIL.ImageDraw.ImageDraw, "textsize"):
         return right - left, bottom - top
     PIL.ImageDraw.ImageDraw.textsize = _textsize
 
-# Tile downloader con timeout de 5s por tile (el default no tiene timeout)
+# Tile downloader con timeout de 5s y descarga paralela
 class _TimeoutTileDownloader(staticmaps.TileDownloader):
     def get(self, provider, cache_dir, zoom, x, y):
         import os
         import pathlib
-        import requests
+        import requests as req_lib
         file_name = None
         if cache_dir is not None:
             file_name = self.cache_file_name(provider, cache_dir, zoom, x, y)
@@ -421,7 +421,7 @@ class _TimeoutTileDownloader(staticmaps.TileDownloader):
         url = provider.url(zoom, x, y)
         if url is None:
             return None
-        res = requests.get(url, headers={"user-agent": self._user_agent}, timeout=5)
+        res = req_lib.get(url, headers={"user-agent": self._user_agent}, timeout=5)
         if res.status_code != 200:
             raise RuntimeError(f"fetch {url} yields {res.status_code}")
         data = res.content
@@ -430,6 +430,21 @@ class _TimeoutTileDownloader(staticmaps.TileDownloader):
             with open(file_name, "wb") as f:
                 f.write(data)
         return data
+
+    def prefetch_parallel(self, provider, cache_dir, tiles):
+        """Pre-descarga tiles en paralelo con ThreadPoolExecutor."""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {
+                pool.submit(self.get, provider, cache_dir, z, x, y): (z, x, y)
+                for z, x, y in tiles
+            }
+            for f in as_completed(futures):
+                try:
+                    f.result()
+                except Exception as exc:
+                    tile = futures[f]
+                    logger.debug("Tile %s falló en prefetch: %s", tile, exc)
 
 _TILE_DOWNLOADER = _TimeoutTileDownloader()
 _TILE_CACHE_DIR = "/tmp/tiles"
@@ -481,7 +496,23 @@ def render_recinto_map(
             context.add_object(area)
             # Zoom +2 pero max 17 para no descargar demasiados tiles
             _center, auto_zoom = context.determine_center_zoom(width, height)
-            context.set_zoom(min(auto_zoom + 2, 17))
+            zoom = min(auto_zoom + 2, 17)
+            context.set_zoom(zoom)
+
+            # Pre-descargar tiles en paralelo (8 hilos) antes de render
+            tile_size = provider.tile_size()
+            trans = staticmaps.Transformer(width, height, zoom, _center, tile_size)
+            tiles_to_fetch = []
+            for yy in range(trans.tiles_y()):
+                y = trans.first_tile_y() + yy
+                if y < 0 or y >= trans.number_of_tiles():
+                    continue
+                for xx in range(trans.tiles_x()):
+                    x = (trans.first_tile_x() + xx) % trans.number_of_tiles()
+                    tiles_to_fetch.append((zoom, x, y))
+            logger.info("Prefetching %d tiles at zoom %d from %s", len(tiles_to_fetch), zoom, provider.name())
+            _TILE_DOWNLOADER.prefetch_parallel(provider, _TILE_CACHE_DIR, tiles_to_fetch)
+
             image = context.render_pillow(width, height)
             break
         except Exception as exc:
