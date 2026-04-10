@@ -932,7 +932,7 @@ def mapa_recinto(
         f.write(png_bytes)
 
     # Build URL — use env var for external host, fallback to internal
-    host = os.environ.get("MCP_IMAGE_HOST", "http://192.168.2.203:31905")
+    host = os.environ.get("MCP_IMAGE_HOST", "http://192.168.2.203:31906")
     image_url = f"{host}/{image_id}"
 
     return [
