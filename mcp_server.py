@@ -107,15 +107,42 @@ class DatabaseError(Exception):
 # ---------------------------------------------------------------------------
 
 
+_pool: dict = {}  # database -> connection (reusable)
+_pool_lock = threading.Lock()
+
+
+def _get_conn(database: str = "TecnicosNet"):
+    """Get or create a reusable connection (simple pool)."""
+    with _pool_lock:
+        conn = _pool.get(database)
+        if conn is not None:
+            try:
+                # Test if connection is still alive
+                cursor = conn.cursor()
+                cursor.execute("SELECT 1")
+                cursor.fetchall()
+                return conn
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                _pool.pop(database, None)
+        # Create new connection
+        cfg = DB_CONFIG.copy()
+        cfg["database"] = database
+        conn = pymssql.connect(**cfg)
+        _pool[database] = conn
+        return conn
+
+
 def _connect(database: str = "TecnicosNet"):
-    cfg = DB_CONFIG.copy()
-    cfg["database"] = database
-    return pymssql.connect(**cfg)
+    return _get_conn(database)
 
 
 def _query(sql: str, database: str = "TecnicosNet") -> list[dict]:
     try:
-        conn = _connect(database)
+        conn = _get_conn(database)
     except Exception as exc:
         logger.error("Error conectando a BD '%s': %s", database, exc)
         raise DatabaseError(f"No se pudo conectar a la base de datos '{database}': {exc}") from exc
@@ -124,10 +151,21 @@ def _query(sql: str, database: str = "TecnicosNet") -> list[dict]:
         cursor.execute(sql)
         return cursor.fetchall()
     except Exception as exc:
-        logger.error("Error ejecutando SQL en '%s': %s", database, exc)
-        raise DatabaseError(f"Error ejecutando consulta en '{database}': {exc}") from exc
-    finally:
-        conn.close()
+        logger.error("Error ejecutando SQL en '%s': %s — reconnecting", database, exc)
+        # Connection may be stale, remove from pool and retry once
+        with _pool_lock:
+            _pool.pop(database, None)
+        try:
+            conn.close()
+        except Exception:
+            pass
+        try:
+            conn = _get_conn(database)
+            cursor = conn.cursor(as_dict=True)
+            cursor.execute(sql)
+            return cursor.fetchall()
+        except Exception as exc2:
+            raise DatabaseError(f"Error ejecutando consulta en '{database}': {exc2}") from exc2
 
 
 def _validate_sigpac_response(data: dict, prov, mun, pol, par, rec) -> dict:
@@ -385,8 +423,8 @@ _OSM_TILE_PROVIDER = staticmaps.TileProvider(
 
 def render_recinto_map(
     coords: list[tuple[float, float]],
-    width: int = 600,
-    height: int = 400,
+    width: int = 400,
+    height: int = 300,
 ) -> bytes:
     """Renderiza un mapa PNG con el polígono del recinto.
 
@@ -406,7 +444,7 @@ def render_recinto_map(
         width=3,
     )
 
-    for provider in [_ARCGIS_TILE_PROVIDER, _OSM_TILE_PROVIDER]:
+    for provider in [_OSM_TILE_PROVIDER, _ARCGIS_TILE_PROVIDER]:
         try:
             context = staticmaps.Context()
             context.set_tile_provider(provider)
