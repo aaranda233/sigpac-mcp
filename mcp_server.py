@@ -7,7 +7,6 @@ PRINCIPIO CRITICO: Nunca devolver datos falsos ni inventados.
 Si algo falla, devolver error explícito. Nunca silenciar errores.
 """
 
-import base64
 import gzip
 import http.server
 import io
