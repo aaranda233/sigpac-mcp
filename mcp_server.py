@@ -444,7 +444,7 @@ def render_recinto_map(
         width=3,
     )
 
-    for provider in [_OSM_TILE_PROVIDER, _ARCGIS_TILE_PROVIDER]:
+    for provider in [_ARCGIS_TILE_PROVIDER, _OSM_TILE_PROVIDER]:
         try:
             context = staticmaps.Context()
             context.set_tile_provider(provider)
