@@ -9,13 +9,17 @@ Si algo falla, devolver error explícito. Nunca silenciar errores.
 
 import base64
 import gzip
+import http.server
 import io
 import json
 import logging
+import os
 import re
 import ssl
 import sys
+import threading
 import urllib.request
+import uuid
 
 import PIL.ImageDraw
 import pymssql
@@ -25,6 +29,47 @@ from mcp.types import ImageContent, TextContent
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("sigpac-mcp")
+
+# ---------------------------------------------------------------------------
+# TEMP IMAGE SERVER — serves generated images via HTTP, deletes after download
+# ---------------------------------------------------------------------------
+TEMP_IMAGE_DIR = "/tmp/mcp-images"
+IMAGE_PORT = 8004
+os.makedirs(TEMP_IMAGE_DIR, exist_ok=True)
+
+
+class _ImageHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        filename = self.path.lstrip("/")
+        if not filename or ".." in filename or "/" in filename:
+            self.send_error(404)
+            return
+        filepath = os.path.join(TEMP_IMAGE_DIR, filename)
+        if not os.path.exists(filepath):
+            self.send_error(404, "Image not found or already downloaded")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Disposition", f"inline; filename={filename}")
+        self.end_headers()
+        with open(filepath, "rb") as f:
+            self.wfile.write(f.read())
+        try:
+            os.unlink(filepath)
+        except OSError:
+            pass
+
+    def log_message(self, fmt, *args):
+        logger.debug("ImageServer: %s", fmt % args)
+
+
+def _start_image_server():
+    server = http.server.HTTPServer(("0.0.0.0", IMAGE_PORT), _ImageHandler)
+    logger.info("Image server started on port %d", IMAGE_PORT)
+    server.serve_forever()
+
+
+threading.Thread(target=_start_image_server, daemon=True).start()
 
 _SSL_CTX = ssl.create_default_context()
 _SSL_CTX.check_hostname = False
@@ -792,7 +837,7 @@ def mapa_recinto(
 ) -> list[TextContent | ImageContent]:
     """Genera una imagen de mapa con el recinto SIGPAC dibujado sobre imagen satélite.
 
-    Devuelve la imagen PNG en base64 junto con metadatos del recinto.
+    Devuelve una URL de descarga temporal (se borra tras descargar) junto con metadatos del recinto.
     Útil para visualizar la ubicación y forma exacta de un recinto.
 
     Args:
@@ -843,11 +888,18 @@ def mapa_recinto(
         f"Región: {region}"
     )
 
-    b64 = base64.b64encode(png_bytes).decode("utf-8")
+    # Save to temp file and return download URL (auto-deletes after download)
+    image_id = f"{uuid.uuid4().hex[:12]}.jpg"
+    filepath = os.path.join(TEMP_IMAGE_DIR, image_id)
+    with open(filepath, "wb") as f:
+        f.write(png_bytes)
+
+    # Build URL — use env var for external host, fallback to internal
+    host = os.environ.get("MCP_IMAGE_HOST", "http://192.168.2.203:31905")
+    image_url = f"{host}/{image_id}"
 
     return [
-        TextContent(type="text", text=metadata),
-        ImageContent(type="image", data=b64, mimeType="image/jpeg"),
+        TextContent(type="text", text=f"{metadata}\n\nImagen del recinto: {image_url}\n(La imagen se eliminará automáticamente tras la descarga)"),
     ]
 
 
