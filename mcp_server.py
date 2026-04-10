@@ -406,18 +406,46 @@ if not hasattr(PIL.ImageDraw.ImageDraw, "textsize"):
         return right - left, bottom - top
     PIL.ImageDraw.ImageDraw.textsize = _textsize
 
+# Tile downloader con timeout de 5s por tile (el default no tiene timeout)
+class _TimeoutTileDownloader(staticmaps.TileDownloader):
+    def get(self, provider, cache_dir, zoom, x, y):
+        import os
+        import pathlib
+        import requests
+        file_name = None
+        if cache_dir is not None:
+            file_name = self.cache_file_name(provider, cache_dir, zoom, x, y)
+            if os.path.isfile(file_name):
+                with open(file_name, "rb") as f:
+                    return f.read()
+        url = provider.url(zoom, x, y)
+        if url is None:
+            return None
+        res = requests.get(url, headers={"user-agent": self._user_agent}, timeout=5)
+        if res.status_code != 200:
+            raise RuntimeError(f"fetch {url} yields {res.status_code}")
+        data = res.content
+        if file_name is not None:
+            pathlib.Path(os.path.dirname(file_name)).mkdir(parents=True, exist_ok=True)
+            with open(file_name, "wb") as f:
+                f.write(data)
+        return data
+
+_TILE_DOWNLOADER = _TimeoutTileDownloader()
+_TILE_CACHE_DIR = "/tmp/tiles"
+
 # Tile providers sin attribution (evita problemas de renderizado de texto)
 _ARCGIS_TILE_PROVIDER = staticmaps.TileProvider(
     name="arcgis_world_imagery",
     url_pattern="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/$z/$y/$x",
-    max_zoom=19,
+    max_zoom=18,
 )
 
 _OSM_TILE_PROVIDER = staticmaps.TileProvider(
     name="osm",
     url_pattern="https://$s.tile.openstreetmap.org/$z/$x/$y.png",
     shards=["a", "b", "c"],
-    max_zoom=19,
+    max_zoom=18,
 )
 
 
@@ -448,10 +476,12 @@ def render_recinto_map(
         try:
             context = staticmaps.Context()
             context.set_tile_provider(provider)
+            context.set_tile_downloader(_TILE_DOWNLOADER)
+            context.set_cache_dir(_TILE_CACHE_DIR)
             context.add_object(area)
-            # Zoom automático + boost para que el recinto se vea grande
+            # Zoom +2 pero max 17 para no descargar demasiados tiles
             _center, auto_zoom = context.determine_center_zoom(width, height)
-            context.set_zoom(min(auto_zoom + 2, 18))
+            context.set_zoom(min(auto_zoom + 2, 17))
             image = context.render_pillow(width, height)
             break
         except Exception as exc:

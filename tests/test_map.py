@@ -1,5 +1,6 @@
 """Tests para generación de mapas de recintos SIGPAC."""
 
+import io
 from unittest.mock import patch
 
 import pytest
@@ -11,7 +12,7 @@ from mcp_server import (
     parse_wkt_polygon,
     render_recinto_map,
 )
-from mcp.types import ImageContent, TextContent
+from mcp.types import TextContent
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +73,7 @@ class TestParseWktPolygon:
 
 
 class TestRenderRecintoMap:
-    """Tests para render_recinto_map con tiles mockeados."""
+    """Tests para render_recinto_map."""
 
     @pytest.fixture()
     def sample_coords(self):
@@ -84,29 +85,29 @@ class TestRenderRecintoMap:
             (-2.45, 37.10),
         ]
 
-    def test_returns_valid_png(self, sample_coords):
-        """Verifica que devuelve bytes PNG válidos (puede usar fallback blanco)."""
-        png = render_recinto_map(sample_coords, 400, 300)
-        assert isinstance(png, bytes)
-        assert len(png) > 0
-        # PNG magic bytes
-        assert png[:4] == b"\x89PNG"
+    def test_returns_valid_jpeg(self, sample_coords):
+        """Verifica que devuelve bytes JPEG válidos."""
+        data = render_recinto_map(sample_coords, 400, 300)
+        assert isinstance(data, bytes)
+        assert len(data) > 0
+        # JPEG magic bytes (FFD8FF)
+        assert data[:2] == b"\xff\xd8"
 
     def test_respects_dimensions(self, sample_coords):
         """Verifica que la imagen tiene las dimensiones solicitadas."""
         from PIL import Image as PILImage
 
-        png = render_recinto_map(sample_coords, 320, 240)
-        img = PILImage.open(io.BytesIO(png))
+        data = render_recinto_map(sample_coords, 320, 240)
+        img = PILImage.open(io.BytesIO(data))
         assert img.size == (320, 240)
 
     def test_default_dimensions(self, sample_coords):
-        """Verifica dimensiones por defecto 600x400."""
+        """Verifica dimensiones por defecto 400x300."""
         from PIL import Image as PILImage
 
-        png = render_recinto_map(sample_coords)
-        img = PILImage.open(io.BytesIO(png))
-        assert img.size == (600, 400)
+        data = render_recinto_map(sample_coords)
+        img = PILImage.open(io.BytesIO(data))
+        assert img.size == (400, 300)
 
 
 # ---------------------------------------------------------------------------
@@ -133,21 +134,19 @@ class TestMapaRecintoTool:
 
     @patch("mcp_server._sigpac_recinfo")
     @patch("mcp_server.render_recinto_map")
-    def test_returns_text_and_image(self, mock_render, mock_api):
+    def test_returns_text_with_url(self, mock_render, mock_api):
         mock_api.return_value = self.VALID_SIGPAC_RESPONSE
-        mock_render.return_value = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
+        mock_render.return_value = b"\xff\xd8\xff\xe0" + b"\x00" * 100
 
         result = mapa_recinto(4, 79, 22, 75, 1)
 
         assert isinstance(result, list)
-        assert len(result) == 2
+        assert len(result) == 1
         assert isinstance(result[0], TextContent)
-        assert isinstance(result[1], ImageContent)
         assert "4/79/22/75/1" in result[0].text
         assert "0.4442" in result[0].text
         assert "IV" in result[0].text
-        assert result[1].mimeType == "image/png"
-        assert len(result[1].data) > 0
+        assert ".jpg" in result[0].text
 
     @patch("mcp_server._sigpac_recinfo")
     def test_api_error_returns_text_error(self, mock_api):
@@ -188,14 +187,11 @@ class TestMapaRecintoTool:
     @patch("mcp_server.render_recinto_map")
     def test_clamps_dimensions(self, mock_render, mock_api):
         mock_api.return_value = self.VALID_SIGPAC_RESPONSE
-        mock_render.return_value = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
+        mock_render.return_value = b"\xff\xd8\xff\xe0" + b"\x00" * 100
 
         mapa_recinto(4, 79, 22, 75, 1, ancho=50, alto=9999)
 
         mock_render.assert_called_once()
         call_args = mock_render.call_args
         assert call_args[0][1] == 200  # min clamp
-        assert call_args[0][2] == 1200  # max clamp
-
-
-import io  # noqa: E402 — needed for TestRenderRecintoMap
+        assert call_args[0][2] == 600  # max clamp
