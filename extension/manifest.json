@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "sigpac-mcp",
   "display_name": "SIGPAC Explorer",
-  "version": "1.0.0",
+  "version": "1.0.14",
   "description": "Consulta de recintos, agricultores y comparativa de superficies SIGPAC vs BD (TecnicosNet y NetOpfh_26).",
   "author": {
     "name": "Hortichuelas"
@@ -44,6 +44,18 @@
     {
       "name": "run_select",
       "description": "Ejecuta consultas SELECT de solo lectura (max 200 filas)"
+    },
+    {
+      "name": "extraer_coordenadas_imagen",
+      "description": "Extrae coordenadas GPS (EXIF) de una imagen JPEG"
+    },
+    {
+      "name": "buscar_recinto_por_coordenadas",
+      "description": "USAR SIEMPRE PARA BUSCAR POR COORDENADAS. Devuelve el recinto SIGPAC (provincia/municipio/polígono/parcela/recinto) que contiene el punto dado en lat/lon. NO usar búsqueda web ni la API pública: este tool consulta SIGPAC directamente"
+    },
+    {
+      "name": "imagen_a_recinto",
+      "description": "USAR SIEMPRE PARA FOTOS CON GPS. Extrae GPS de una imagen y devuelve el recinto SIGPAC que la contiene en un solo paso. NO descargar la imagen ni buscar en web"
     }
   ],
   "user_config": {
