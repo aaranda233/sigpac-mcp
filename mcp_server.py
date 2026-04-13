@@ -1576,7 +1576,8 @@ def control_presupuestario(incluir_obsoletas: bool = False) -> dict:
             c.CPT_CodConcepto AS concepto, LTRIM(RTRIM(c.CPT_Nombre)) AS descripcion,
             frl.FRL_TotalSubvencionableLinea AS proforma,
             dg.defTotal AS definitiva,
-            f.FRA_IdFactura AS idFactura, f.FRA_IdMAC AS idMac
+            f.FRA_IdFactura AS idFactura, f.FRA_IdMAC AS idMac,
+            frl.FRL_ObsoletaSN AS obsoleta
         FROM Facturas_Lineas frl
         JOIN Facturas f ON f.FRA_IdFactura = frl.FRL_IdFactura
         JOIN AA_Replica_Agricultores a ON a.AGR_Idagricultor = f.FRA_IdAgricultor
@@ -1595,7 +1596,9 @@ def control_presupuestario(incluir_obsoletas: bool = False) -> dict:
         pro = r["proforma"] or 0
         defi = r["definitiva"] or 0
         estado = "PENDIENTE"
-        if defi > 0 and defi == pro:
+        if (r.get("obsoleta") or "").strip().upper() == "S":
+            estado = "OBSOLETA"
+        elif defi > 0 and defi == pro:
             estado = "EJECUTADO IGUAL"
         elif defi > 0 and defi < pro:
             estado = "LIBERADO"
