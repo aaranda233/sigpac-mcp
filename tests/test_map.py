@@ -147,6 +147,8 @@ class TestMapaRecintoTool:
         assert "0.4442" in result[0].text
         assert "IV" in result[0].text
         assert ".jpg" in result[0].text
+        assert "URL_IMAGEN:" in result[0].text
+        assert "INSTRUCCIÓN PARA EL MODELO" in result[0].text
 
     @patch("mcp_server._sigpac_recinfo")
     def test_api_error_returns_text_error(self, mock_api):

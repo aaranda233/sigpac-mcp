@@ -20,6 +20,8 @@ import threading
 import urllib.request
 import uuid
 
+import PIL.ExifTags
+import PIL.Image
 import PIL.ImageDraw
 import pymssql
 import staticmaps
@@ -273,6 +275,142 @@ def _sigpac_recinfo(prov, mun, pol, par, rec) -> dict:
         )
 
     return _validate_sigpac_response(record, prov, mun, pol, par, rec)
+
+
+# Bounding box aproximado de España (incluye Canarias, Ceuta y Melilla)
+SPAIN_BBOX = {"lat_min": 27.5, "lat_max": 44.0, "lon_min": -18.3, "lon_max": 4.5}
+
+
+def _dms_to_decimal(dms: tuple, ref: str) -> float:
+    """Convierte (grados, minutos, segundos) + referencia (N/S/E/W) a decimal."""
+    if not dms or len(dms) < 3:
+        raise ValueError(f"Formato DMS inválido: {dms!r}")
+    try:
+        deg, mnt, sec = float(dms[0]), float(dms[1]), float(dms[2])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"DMS no numérico: {dms!r}") from exc
+    decimal = deg + mnt / 60.0 + sec / 3600.0
+    if ref in ("S", "W"):
+        decimal = -decimal
+    return decimal
+
+
+def _coords_in_spain(lat: float, lon: float) -> bool:
+    """Comprueba si las coordenadas están dentro del bbox de España."""
+    return (
+        SPAIN_BBOX["lat_min"] <= lat <= SPAIN_BBOX["lat_max"]
+        and SPAIN_BBOX["lon_min"] <= lon <= SPAIN_BBOX["lon_max"]
+    )
+
+
+def _extract_gps_from_image(image_path: str) -> dict:
+    """Extrae coordenadas GPS (EXIF) de una imagen JPEG.
+
+    Returns: dict con 'latitud', 'longitud' y opcionalmente 'altitud'.
+    Raises: FileNotFoundError si el archivo no existe.
+            ValueError si no hay EXIF GPS o las coordenadas no son válidas.
+    """
+    if not os.path.exists(image_path):
+        raise FileNotFoundError(f"Imagen no encontrada: {image_path}")
+
+    try:
+        img = PIL.Image.open(image_path)
+    except Exception as exc:
+        raise ValueError(f"No se pudo abrir la imagen '{image_path}': {exc}") from exc
+
+    exif = img.getexif()
+    if not exif:
+        raise ValueError(f"La imagen '{image_path}' no contiene metadatos EXIF")
+
+    gps = exif.get_ifd(PIL.ExifTags.IFD.GPSInfo)
+    if not gps:
+        raise ValueError(f"La imagen '{image_path}' no contiene datos GPS en EXIF")
+
+    # Tags GPS: 1=LatRef, 2=Lat, 3=LonRef, 4=Lon, 6=Altitude
+    lat_ref = gps.get(1)
+    lat_dms = gps.get(2)
+    lon_ref = gps.get(3)
+    lon_dms = gps.get(4)
+
+    if not (lat_ref and lat_dms and lon_ref and lon_dms):
+        raise ValueError(
+            f"Datos GPS incompletos en '{image_path}': lat_ref={lat_ref}, lon_ref={lon_ref}"
+        )
+
+    lat = _dms_to_decimal(lat_dms, lat_ref)
+    lon = _dms_to_decimal(lon_dms, lon_ref)
+
+    if not _coords_in_spain(lat, lon):
+        raise ValueError(
+            f"Coordenadas fuera de España: lat={lat:.6f}, lon={lon:.6f}"
+        )
+
+    result = {"latitud": round(lat, 7), "longitud": round(lon, 7)}
+    alt = gps.get(6)
+    if alt is not None:
+        try:
+            result["altitud"] = round(float(alt), 2)
+        except (TypeError, ValueError):
+            pass
+    return result
+
+
+def _sigpac_recinfo_by_point(lon: float, lat: float) -> dict:
+    """Consulta la API SIGPAC por punto (lon, lat) en EPSG:4258.
+
+    Returns: dict con datos del recinto que contiene el punto.
+    Raises: SigpacApiError si no se puede conectar o no hay recinto.
+    """
+    url = f"{SIGPAC_API}/recinfobypoint/4258/{lon}/{lat}.json"
+    try:
+        req = urllib.request.Request(url, headers={"Accept-Encoding": "gzip"})
+        with urllib.request.urlopen(req, timeout=10, context=_SSL_CTX) as resp:
+            raw = resp.read()
+            try:
+                raw = gzip.decompress(raw)
+            except Exception:
+                pass
+            data = json.loads(raw)
+    except urllib.error.HTTPError as exc:
+        logger.error("HTTP %s al consultar SIGPAC por punto: %s", exc.code, url)
+        raise SigpacApiError(
+            f"Error HTTP {exc.code} de la API SIGPAC para punto ({lon}, {lat})"
+        ) from exc
+    except urllib.error.URLError as exc:
+        logger.error("Error de red al consultar SIGPAC por punto: %s", exc.reason)
+        raise SigpacApiError(
+            f"Error de red al consultar SIGPAC para punto ({lon}, {lat}): {exc.reason}"
+        ) from exc
+    except json.JSONDecodeError as exc:
+        logger.error("Respuesta SIGPAC no es JSON válido: %s", exc)
+        raise SigpacApiError(
+            f"Respuesta de SIGPAC no es JSON válido para punto ({lon}, {lat})"
+        ) from exc
+    except Exception as exc:
+        logger.error("Error inesperado al consultar SIGPAC por punto: %s", exc)
+        raise SigpacApiError(
+            f"Error inesperado al consultar SIGPAC para punto ({lon}, {lat}): {exc}"
+        ) from exc
+
+    if isinstance(data, list):
+        if not data:
+            raise SigpacApiError(
+                f"SIGPAC no encontró ningún recinto en el punto ({lon}, {lat})"
+            )
+        record = data[0]
+    elif isinstance(data, dict) and data:
+        record = data
+    else:
+        raise SigpacApiError(
+            f"Respuesta SIGPAC inesperada (tipo {type(data).__name__}) para punto ({lon}, {lat})"
+        )
+
+    missing = SIGPAC_REQUIRED_FIELDS - set(record.keys())
+    if missing:
+        raise SigpacApiError(
+            f"Respuesta SIGPAC por punto incompleta, faltan campos: {', '.join(sorted(missing))}"
+        )
+    return record
 
 
 def hectareas_a_m2(hectareas: float) -> int:
@@ -997,7 +1135,18 @@ def mapa_recinto(
     image_url = f"{host}/{image_id}"
 
     return [
-        TextContent(type="text", text=f"{metadata}\n\nImagen del recinto: {image_url}\n(La imagen se eliminará automáticamente tras la descarga)"),
+        TextContent(
+            type="text",
+            text=(
+                f"{metadata}\n\n"
+                f"URL_IMAGEN: {image_url}\n\n"
+                f"INSTRUCCIÓN PARA EL MODELO: Devuelve esta URL tal cual al usuario "
+                f"(exactamente: {image_url}). NO descargues la imagen, NO la proceses, "
+                f"NO la describas, NO generes código para abrirla. Limítate a mostrar la URL "
+                f"al usuario para que él la abra en su navegador. "
+                f"La imagen se eliminará automáticamente tras la primera descarga."
+            ),
+        ),
     ]
 
 
@@ -1491,6 +1640,81 @@ def control_presupuestario(incluir_obsoletas: bool = False) -> dict:
         "capas": capas,
         "anualidad": anualidad[0] if anualidad else None,
     }
+
+
+@mcp.tool()
+def extraer_coordenadas_imagen(ruta_imagen: str) -> dict:
+    """Extrae las coordenadas GPS (EXIF) de una imagen JPEG.
+
+    Args:
+        ruta_imagen: Ruta absoluta al archivo de imagen.
+
+    Returns:
+        dict con 'latitud', 'longitud' y opcionalmente 'altitud' (metros).
+        Si falla, devuelve {'error': '...'}.
+    """
+    try:
+        return _extract_gps_from_image(ruta_imagen)
+    except (FileNotFoundError, ValueError) as exc:
+        return {"error": str(exc)}
+    except Exception as exc:
+        logger.exception("Error inesperado extrayendo GPS de %s", ruta_imagen)
+        return {"error": f"Error inesperado: {exc}"}
+
+
+@mcp.tool()
+def buscar_recinto_por_coordenadas(latitud: float, longitud: float) -> dict:
+    """Devuelve el recinto SIGPAC que contiene las coordenadas dadas.
+
+    Args:
+        latitud: Latitud en grados decimales WGS84/ETRS89 (ej: 36.85).
+        longitud: Longitud en grados decimales WGS84/ETRS89 (ej: -2.12).
+
+    Returns:
+        dict con provincia, municipio, polígono, parcela, recinto, superficie, uso_sigpac...
+        Si falla, devuelve {'error': '...'}.
+    """
+    if not _coords_in_spain(latitud, longitud):
+        return {"error": f"Coordenadas fuera de España: lat={latitud}, lon={longitud}"}
+
+    try:
+        record = _sigpac_recinfo_by_point(longitud, latitud)
+    except SigpacApiError as exc:
+        return {"error": str(exc)}
+
+    result = {k: v for k, v in record.items() if k != "wkt"}
+    result["datos_fiables"] = True
+    return result
+
+
+@mcp.tool()
+def imagen_a_recinto(ruta_imagen: str) -> dict:
+    """Extrae GPS de una imagen y devuelve el recinto SIGPAC que la contiene.
+
+    Flujo combinado: EXIF → coordenadas → SIGPAC → recinto.
+
+    Args:
+        ruta_imagen: Ruta absoluta al archivo JPEG con EXIF GPS.
+
+    Returns:
+        dict con 'coordenadas' (lat/lon/alt) y 'recinto' (datos SIGPAC).
+        Si falla parcialmente, incluye los datos obtenidos y 'error'.
+    """
+    try:
+        coords = _extract_gps_from_image(ruta_imagen)
+    except (FileNotFoundError, ValueError) as exc:
+        return {"error": str(exc)}
+    except Exception as exc:
+        logger.exception("Error inesperado extrayendo GPS de %s", ruta_imagen)
+        return {"error": f"Error inesperado extrayendo GPS: {exc}"}
+
+    try:
+        record = _sigpac_recinfo_by_point(coords["longitud"], coords["latitud"])
+    except SigpacApiError as exc:
+        return {"coordenadas": coords, "error": str(exc)}
+
+    recinto = {k: v for k, v in record.items() if k != "wkt"}
+    return {"coordenadas": coords, "recinto": recinto, "datos_fiables": True}
 
 
 if __name__ == "__main__":
