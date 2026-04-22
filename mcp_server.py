@@ -1,6 +1,6 @@
 """MCP Server para SIGPAC: consulta de recintos, agricultores y comparativa de superficies.
 
-Conecta a TecnicosNet y NetOpfh_26 en 192.168.2.36:1433.
+Conecta a TecnicosNet y NetOpfh_21..NetOpfh_26 en 192.168.2.36:1433.
 Incluye consulta directa a la API SIGPAC para comparar superficies.
 
 PRINCIPIO CRITICO: Nunca devolver datos falsos ni inventados.
@@ -1020,15 +1020,15 @@ def run_select(sql: str, database: str = "TecnicosNet") -> list[dict]:
     """Ejecuta una consulta SELECT de solo lectura (max 200 filas).
 
     SOLO se permiten SELECT. Cualquier INSERT, UPDATE, DELETE, etc. sera rechazado.
-    Bases de datos permitidas: TecnicosNet, NetOpfh_26.
+    Bases de datos permitidas: TecnicosNet, NetOpfh_21..NetOpfh_26.
 
     Args:
         sql: Consulta SQL (debe empezar con SELECT o WITH).
-        database: Base de datos (TecnicosNet o NetOpfh_26).
+        database: Base de datos (TecnicosNet o NetOpfh_21..NetOpfh_26).
     """
-    allowed = {"tecnicosnet", "netopfh_26"}
+    allowed = {"tecnicosnet"} | {f"netopfh_{y}" for y in range(21, 27)}
     if database.lower() not in allowed:
-        return [{"error": f"Base de datos '{database}' no permitida. Solo: TecnicosNet, NetOpfh_26."}]
+        return [{"error": f"Base de datos '{database}' no permitida. Solo: TecnicosNet, NetOpfh_21..NetOpfh_26."}]
 
     sql_stripped = sql.strip()
     if not re.match(r"^(SELECT|WITH)\b", sql_stripped, re.IGNORECASE):
